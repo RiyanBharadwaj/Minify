@@ -28,12 +28,6 @@ Minify is a simple and efficient Android app designed to compress videos and con
 
 ---
 
-## 📸 Screenshots
-
-*(Add screenshots here later)*
-
----
-
 ## ⚠️ Current Status
 
 Minify is currently in its **initial release (v1.0)**.
