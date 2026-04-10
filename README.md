@@ -44,7 +44,6 @@ Minify is currently in its **initial release (v1.0)**.
 - Add more format support
 - UI/UX enhancements
 - Batch processing
-- Advanced compression settings
 
 ---
 
