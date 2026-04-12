@@ -5,19 +5,18 @@ plugins {
 
 android {
     namespace = "com.shanks.minify"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.shanks.minify"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // 🔥 Only support ARM architectures to kill x86 bloat
         ndk {
-            abiFilters.clear()
+            // This already tells Android to only include these two architectures
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
         }
     }
@@ -27,7 +26,6 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
 
-            // 🔥 Strips debug symbols from native libs to save several MBs
             ndk {
                 debugSymbolLevel = "none"
             }
@@ -37,30 +35,16 @@ android {
                 "proguard-rules.pro"
             )
 
-            // Use debug signing for easy manual testing on your phone
             signingConfig = signingConfigs.getByName("debug")
         }
     }
 
     packaging {
         jniLibs {
-            // 🔥 Force compression of native libraries (Saves ~10-20MB)
-            useLegacyPackaging = true
+            // Required for 16KB page alignment on Android 15
+            useLegacyPackaging = false
 
-            // Explicitly exclude all x86/x64 files
-            excludes.add("lib/x86/**")
-            excludes.add("lib/x86_64/**")
-
-            // Prioritize your custom tiny engines
-            pickFirsts.add("**/libavcodec.so")
-            pickFirsts.add("**/libavformat.so")
-            pickFirsts.add("**/libavutil.so")
-            pickFirsts.add("**/libavfilter.so")
-            pickFirsts.add("**/libswscale.so")
-            pickFirsts.add("**/libswresample.so")
-            pickFirsts.add("**/libavdevice.so")
-            pickFirsts.add("**/libffmpegkit.so")
-            pickFirsts.add("**/libffmpegkit_abidetect.so")
+            // Manual excludes removed as abiFilters above handles this automatically
         }
     }
 
@@ -82,9 +66,10 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
 
-    // FFmpeg Java Bridge
-    implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1")
+    implementation("androidx.media3:media3-transformer:1.10.0")
+    implementation("androidx.media3:media3-effect:1.10.0")
+    implementation("androidx.media3:media3-common:1.10.0")
 
-    implementation("androidx.media3:media3-exoplayer:1.3.1")
-    implementation("androidx.media3:media3-ui:1.3.1")
+    implementation("androidx.media3:media3-exoplayer:1.10.0")
+    implementation("androidx.media3:media3-ui:1.10.0")
 }

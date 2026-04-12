@@ -1,21 +1,34 @@
-# 1. FFmpeg Kit - Keep only the entry points and JNI bridges
--keep class com.arthenica.ffmpegkit.FFmpegKit { *; }
--keep class com.arthenica.ffmpegkit.Session { *; }
--keep class com.arthenica.ffmpegkit.ReturnCode { *; }
--keep class com.arthenica.ffmpegkit.FFmpegKitConfig { *; }
--keep class com.moizhassan.ffmpeg.** { *; }
+# --- FFmpegKit Core ---
+# Prevents stripping the JNI bridge and core logic
+-keep class com.arthenica.ffmpegkit.** { *; }
+-keep interface com.arthenica.ffmpegkit.** { *; }
+-dontwarn com.arthenica.ffmpegkit.**
 
-# 2. Media3 / ExoPlayer - Keep core playback and UI
--keep class androidx.media3.exoplayer.** { *; }
--keep class androidx.media3.ui.** { *; }
--keep class androidx.media3.common.** { *; }
+# Support for SmartException (hyphenated package fix)
+-keep class com.arthenica.** { *; }
+-dontwarn com.arthenica.**
 
-# 3. Optimization - Allow R8 to rename and remove unused code aggressively
--optimizationpasses 5
--allowaccessmodification
--dontpreverify
-
-# 4. Handle Native Methods
+# --- Native Method Handling ---
+# CRITICAL: Keeps the link between Java and C++ code
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+
+# --- Media3 / ExoPlayer ---
+# Keeps necessary components for media playback
+-keep class androidx.media3.** { *; }
+-dontwarn androidx.media3.**
+
+# --- General Optimizations ---
+# Use the default number of passes (1) unless you specifically need more
+-optimizationpasses 1
+-allowaccessmodification
+-dontpreverify
+
+# --- Jetpack / Lifecycle ---
+-keepclassmembers class * extends androidx.lifecycle.ViewModel {
+    <init>(...);
+}
+
+# Keep attributes needed for debugging and generic types
+-keepattributes Signature, Exceptions, *Annotation*, SourceFile, LineNumberTable
