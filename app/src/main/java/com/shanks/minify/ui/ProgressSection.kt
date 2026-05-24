@@ -18,7 +18,7 @@ import androidx.compose.ui.unit.sp
 fun ProgressSection(progress: Float, status: String) {
     val isIdle = status == "Idle"
     val isDone = status.startsWith("Done")
-    val isError = status.startsWith("Error")
+    val isError = status.startsWith("Compression failed")
 
     Card(
         shape = RoundedCornerShape(16.dp),

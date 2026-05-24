@@ -23,22 +23,51 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.shanks.minify.media3.VideoCompressor
+import com.shanks.minify.utils.VideoInfo
+import com.shanks.minify.utils.getVideoInfo
 import com.shanks.minify.utils.saveToGallery
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.File
+
+private fun friendlyError(e: Exception): String {
+    val msg = e.localizedMessage ?: e.javaClass.simpleName
+    return when {
+        msg.contains("codec", ignoreCase = true) ||
+                msg.contains("CodecInfo", ignoreCase = true) ->
+            "Compression failed ❌ — this video format isn't supported on your device. Try switching codec (H.264 ↔ H.265) or a lower quality."
+        msg.contains("permission", ignoreCase = true) ->
+            "Compression failed ❌ — storage permission denied."
+        msg.contains("space", ignoreCase = true) ||
+                msg.contains("ENOSPC", ignoreCase = true) ->
+            "Compression failed ❌ — not enough storage space."
+        msg.contains("timeout", ignoreCase = true) ->
+            "Compression failed ❌ — timed out. Try a shorter video."
+        else ->
+            "Compression failed ❌ — try a different codec or quality setting."
+    }
+}
 
 @UnstableApi
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
 
-    // rememberSaveable so state survives config changes (e.g. screen rotation mid-compression)
     var selectedUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var videoInfo by remember { mutableStateOf<VideoInfo?>(null) }
     var progress by rememberSaveable { mutableFloatStateOf(0f) }
     var status by rememberSaveable { mutableStateOf("Idle") }
     var quality by rememberSaveable { mutableIntStateOf(2) }
     var useH265 by rememberSaveable { mutableStateOf(false) }
     var isCompressing by rememberSaveable { mutableStateOf(false) }
+
+    // Load VideoInfo off the main thread whenever the URI changes
+    LaunchedEffect(selectedUri) {
+        videoInfo = selectedUri?.let { uri ->
+            withContext(Dispatchers.IO) { getVideoInfo(context, uri) }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -48,7 +77,6 @@ fun MainScreen() {
             .padding(horizontal = 20.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Header
         Text(
             text = "Minify",
             fontSize = 32.sp,
@@ -70,7 +98,6 @@ fun MainScreen() {
             isCompressing = false
         }
 
-        // Animated swap between: empty / video preview / compression spinner
         AnimatedContent(
             targetState = when {
                 isCompressing -> "compressing"
@@ -88,8 +115,10 @@ fun MainScreen() {
 
         FunctionSection(
             selectedUri = selectedUri,
+            videoInfo = videoInfo,
             quality = quality,
             isCompressing = isCompressing,
+            useH265 = useH265,
             onQuality = { quality = it },
             onStart = { uri ->
                 isCompressing = true
@@ -112,14 +141,13 @@ fun MainScreen() {
                         } catch (e: Exception) {
                             status = "Save failed: ${e.localizedMessage}"
                         } finally {
-                            // Always delete the cache temp file after saving
                             output.delete()
                         }
                         isCompressing = false
                     },
                     onFailure = { error ->
-                        output.delete() // Clean up temp file on failure too
-                        status = "Error: ${error.localizedMessage}"
+                        output.delete()
+                        status = friendlyError(error)
                         isCompressing = false
                     }
                 )
@@ -168,23 +196,18 @@ private fun CompressionPlaceholder() {
 fun VideoPreview(uri: Uri) {
     val context = LocalContext.current
 
-    // Single stable player for the lifetime of this composable — not keyed on uri.
-    // Rebuilding the player on each URI change caused a race: the old player was
-    // released AFTER the new one was assigned to PlayerView, blanking the preview.
     val player = remember {
         ExoPlayer.Builder(context).build().apply {
             playWhenReady = false
         }
     }
 
-    // Swap media item whenever uri changes — no player rebuild needed.
     LaunchedEffect(uri) {
         player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
         player.seekTo(0)
     }
 
-    // Release only when the composable leaves the composition entirely.
     DisposableEffect(Unit) {
         onDispose { player.release() }
     }
@@ -199,11 +222,9 @@ fun VideoPreview(uri: Uri) {
             PlayerView(ctx).apply {
                 this.player = player
                 useController = true
-                // Override ExoPlayer's default black background with a neutral dark gray
                 setBackgroundColor(android.graphics.Color.parseColor("#1C1C1E"))
                 subtitleView?.visibility = android.view.View.GONE
             }
         }
-        // No update block needed — player reference is stable
     )
 }

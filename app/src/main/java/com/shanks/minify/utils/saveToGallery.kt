@@ -7,13 +7,11 @@ import android.os.Environment
 import android.provider.MediaStore
 import java.io.File
 
-fun SaveToGallery(context: Context, file: File): Uri {
-    // Delete all previous Minify exports before saving the new one
-    // so Movies/Minify never fills up with old compressed files
-    val deleteUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+fun saveToGallery(context: Context, file: File): Uri {
+    // Remove previous Minify exports so Movies/Minify doesn't accumulate old files
     val where = "${MediaStore.Video.Media.RELATIVE_PATH} = ? AND ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ?"
     val args = arrayOf(Environment.DIRECTORY_MOVIES + "/Minify/", "Minify_%")
-    context.contentResolver.delete(deleteUri, where, args)
+    context.contentResolver.delete(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, where, args)
 
     val values = ContentValues().apply {
         put(MediaStore.Video.Media.DISPLAY_NAME, "Minify_${System.currentTimeMillis()}.mp4")
@@ -24,13 +22,11 @@ fun SaveToGallery(context: Context, file: File): Uri {
     val uri = context.contentResolver.insert(
         MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
         values
-    ) ?: throw IllegalStateException(
-        "MediaStore insert failed — storage permission may be missing"
-    )
+    ) ?: throw IllegalStateException("MediaStore insert failed — storage permission may be missing")
 
     return try {
-        context.contentResolver.openOutputStream(uri)?.use { output ->
-            file.inputStream().use { input -> input.copyTo(output) }
+        context.contentResolver.openOutputStream(uri)?.use { out ->
+            file.inputStream().use { it.copyTo(out) }
         }
         uri
     } catch (e: Exception) {
