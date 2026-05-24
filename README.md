@@ -30,7 +30,7 @@ Minify is a simple and efficient Android app designed to compress videos and con
 
 ## ⚠️ Current Status
 
-Minify is currently in its **initial release (v1.0)**.
+Minify is currently in its **stable release (V3.0)**.
 
 - Some features may be incomplete
 - Bugs may be present
@@ -60,7 +60,7 @@ Feel free to:
 
 ## 📄 License
 
-This project is licensed under the GNU V3.0 License.
+This project is licensed under the MIT License.
 
 ---
 
