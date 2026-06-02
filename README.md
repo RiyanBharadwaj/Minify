@@ -72,7 +72,6 @@ Known limitations:
 * 🎵 Audio compression options
 * 📊 Detailed compression statistics
 * 🌙 Additional UI customization
-* 🚀 Further FFmpeg optimization
 * 🎬 More output format support
 
 ---
