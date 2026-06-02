@@ -12,18 +12,6 @@ Minify is a powerful Android video compression app focused on delivering high-qu
 * Accurate bitrate calculation
 * Automatic resolution scaling when needed
 
-### 🎥 Multiple Encoder Modes
-
-* **Auto** — Automatically selects the best available encoder
-* **MediaCodec** — Fast hardware-accelerated compression
-* **FFmpeg** — Higher quality software compression
-
-### 💎 Visually Lossless Mode
-
-* Preserves visual quality with virtually no noticeable degradation
-* Uses FFmpeg H.264 CRF-based encoding
-* Ideal for users who want maximum quality retention
-
 ### ⚡ Performance Features
 
 * Compression cancellation support
@@ -51,7 +39,6 @@ Minify is a powerful Android video compression app focused on delivering high-qu
 * Kotlin
 * Android SDK
 * Jetpack Compose
-* FFmpeg
 * MediaCodec
 * ExoPlayer (Media3)
 
@@ -59,13 +46,11 @@ Minify is a powerful Android video compression app focused on delivering high-qu
 
 ## ⚠️ Current Status
 
-### Stable Release — V5.0
+### Pre Release — V5.0
 
 Current highlights:
 
-* ✅ FFmpeg integration completed
 * ✅ MediaCodec support completed
-* ✅ Visually Lossless mode implemented
 * ✅ Compression cancellation support
 * ✅ Video preview support
 * ✅ Automatic cleanup system
@@ -73,8 +58,7 @@ Current highlights:
 
 Known limitations:
 
-* H.265 Visually Lossless mode is currently disabled due to extremely slow software encoding on most Android devices.
-* Compression speed depends heavily on device hardware.
+* Might not work on all android devices
 
 ---
 
