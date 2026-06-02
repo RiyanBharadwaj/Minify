@@ -1,3 +1,5 @@
+@file:OptIn(androidx.media3.common.util.UnstableApi::class)
+
 package com.shanks.minify.ui
 
 import android.net.Uri
@@ -19,9 +21,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
-import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.shanks.minify.media3.CompressionJob
 import com.shanks.minify.media3.VideoCompressor
 import com.shanks.minify.utils.VideoInfo
 import com.shanks.minify.utils.getVideoInfo
@@ -34,35 +36,37 @@ import java.io.File
 private fun friendlyError(e: Exception): String {
     val msg = e.localizedMessage ?: e.javaClass.simpleName
     return when {
-        msg.contains("codec", ignoreCase = true) ||
+        msg.contains("codec",     ignoreCase = true) ||
                 msg.contains("CodecInfo", ignoreCase = true) ->
-            "Compression failed ❌ — this video format isn't supported on your device. Try switching codec (H.264 ↔ H.265) or a lower quality."
+            "Compression failed ❌ — this video format isn't supported on your device. Try switching codec (H.264 ↔ H.265)."
         msg.contains("permission", ignoreCase = true) ->
             "Compression failed ❌ — storage permission denied."
-        msg.contains("space", ignoreCase = true) ||
+        msg.contains("space",  ignoreCase = true) ||
                 msg.contains("ENOSPC", ignoreCase = true) ->
             "Compression failed ❌ — not enough storage space."
         msg.contains("timeout", ignoreCase = true) ->
             "Compression failed ❌ — timed out. Try a shorter video."
         else ->
-            "Compression failed ❌ — try a different codec or quality setting."
+            "Compression failed ❌ — try a different codec or target size."
     }
 }
 
-@UnstableApi
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
 
-    var selectedUri by rememberSaveable { mutableStateOf<Uri?>(null) }
-    var videoInfo by remember { mutableStateOf<VideoInfo?>(null) }
-    var progress by rememberSaveable { mutableFloatStateOf(0f) }
-    var status by rememberSaveable { mutableStateOf("Idle") }
-    var quality by rememberSaveable { mutableIntStateOf(2) }
-    var useH265 by rememberSaveable { mutableStateOf(false) }
-    var isCompressing by rememberSaveable { mutableStateOf(false) }
+    var selectedUri     by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var videoInfo       by remember { mutableStateOf<VideoInfo?>(null) }
+    var progress        by rememberSaveable { mutableFloatStateOf(0f) }
+    var status          by rememberSaveable { mutableStateOf("Idle") }
+    var sizePresetIndex by rememberSaveable { mutableIntStateOf(2) }
+    var customSizeMb    by rememberSaveable { mutableStateOf<Float?>(null) }
+    var useH265         by rememberSaveable { mutableStateOf(false) }
+    var isCompressing   by rememberSaveable { mutableStateOf(false) }
 
-    // Load VideoInfo off the main thread whenever the URI changes
+    // Not saveable — compression cannot survive process death.
+    val activeJob = remember { mutableStateOf<CompressionJob?>(null) }
+
     LaunchedEffect(selectedUri) {
         videoInfo = selectedUri?.let { uri ->
             withContext(Dispatchers.IO) { getVideoInfo(context, uri) }
@@ -92,49 +96,57 @@ fun MainScreen() {
         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
         FileSection(selectedUri) { uri ->
+            // FIX: fully reset compression state when a new file is picked,
+            // including cancelling any in-flight job so we don't leak it.
+            if (isCompressing) {
+                activeJob.value?.cancel()
+                activeJob.value  = null
+                isCompressing    = false
+            }
             selectedUri = uri
-            progress = 0f
-            status = "Idle"
-            isCompressing = false
+            progress    = 0f
+            status      = "Idle"
         }
 
         AnimatedContent(
             targetState = when {
-                isCompressing -> "compressing"
+                isCompressing       -> "compressing"
                 selectedUri != null -> "preview"
-                else -> "empty"
+                else                -> "empty"
             },
             label = "preview_state"
         ) { state ->
             when (state) {
-                "preview" -> VideoPreview(selectedUri!!)
+                "preview"     -> VideoPreview(selectedUri!!)
                 "compressing" -> CompressionPlaceholder()
-                else -> Unit
+                else          -> Unit
             }
         }
 
         FunctionSection(
-            selectedUri = selectedUri,
-            videoInfo = videoInfo,
-            quality = quality,
-            isCompressing = isCompressing,
-            useH265 = useH265,
-            onQuality = { quality = it },
-            onStart = { uri ->
+            selectedUri     = selectedUri,
+            videoInfo       = videoInfo,
+            sizePresetIndex = sizePresetIndex,
+            customSizeMb    = customSizeMb,
+            isCompressing   = isCompressing,
+            useH265         = useH265,
+            onPresetIndex   = { sizePresetIndex = it },
+            onCustomSizeMb  = { customSizeMb = it },
+            onStart         = { uri, effectiveMb ->
                 isCompressing = true
-                status = "Processing…"
-                progress = 0f
+                status        = "Processing…"
+                progress      = 0f
 
                 val output = File(context.cacheDir, "out_${System.currentTimeMillis()}.mp4")
 
-                VideoCompressor.compress(
-                    context = context,
-                    inputUri = uri,
-                    outputPath = output.absolutePath,
-                    useH265 = useH265,
-                    quality = quality,
-                    onProgress = { progress = it },
-                    onSuccess = {
+                val job = VideoCompressor.compress(
+                    context      = context,
+                    inputUri     = uri,
+                    outputPath   = output.absolutePath,
+                    useH265      = useH265,
+                    targetSizeMb = effectiveMb,
+                    onProgress   = { progress = it },
+                    onSuccess    = {
                         try {
                             saveToGallery(context, output)
                             status = "Done ✅"
@@ -143,14 +155,29 @@ fun MainScreen() {
                         } finally {
                             output.delete()
                         }
-                        isCompressing = false
+                        isCompressing   = false
+                        activeJob.value = null
                     },
-                    onFailure = { error ->
+                    onCancelled  = {
                         output.delete()
-                        status = friendlyError(error)
-                        isCompressing = false
+                        status          = "Cancelled"
+                        progress        = 0f
+                        isCompressing   = false
+                        activeJob.value = null
+                    },
+                    onFailure    = { error ->
+                        output.delete()
+                        status          = friendlyError(error)
+                        isCompressing   = false
+                        activeJob.value = null
                     }
                 )
+                activeJob.value = job
+            },
+            onStop = {
+                // FIX: guard against double-cancel (e.g. rapid taps on Stop).
+                activeJob.value?.cancel()
+                // activeJob is cleared in the onCancelled callback above.
             }
         )
 
@@ -159,10 +186,12 @@ fun MainScreen() {
         ProgressSection(progress, status)
     }
 
+    // Auto-clear terminal status messages after a short delay.
     LaunchedEffect(status) {
-        if (status.startsWith("Done")) {
+        if (status.startsWith("Done") || status == "Cancelled") {
             delay(3000)
-            status = "Idle"
+            status   = "Idle"
+            progress = 0f
         }
     }
 }
@@ -191,15 +220,12 @@ private fun CompressionPlaceholder() {
     }
 }
 
-@UnstableApi
 @Composable
 fun VideoPreview(uri: Uri) {
     val context = LocalContext.current
 
     val player = remember {
-        ExoPlayer.Builder(context).build().apply {
-            playWhenReady = false
-        }
+        ExoPlayer.Builder(context).build().apply { playWhenReady = false }
     }
 
     LaunchedEffect(uri) {
@@ -220,7 +246,7 @@ fun VideoPreview(uri: Uri) {
             .clip(RoundedCornerShape(12.dp)),
         factory = { ctx ->
             PlayerView(ctx).apply {
-                this.player = player
+                this.player  = player
                 useController = true
                 setBackgroundColor(android.graphics.Color.parseColor("#1C1C1E"))
                 subtitleView?.visibility = android.view.View.GONE
