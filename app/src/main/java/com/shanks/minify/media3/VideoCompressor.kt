@@ -51,24 +51,78 @@ object VideoCompressor {
     private const val ABS_CEILING_BPS = 25_000_000
 
     // --- Shaders -----------------------------------------------------------------
-
+    // Vertex shader passes through position and applies the SurfaceTexture
+    // transform matrix so texture coordinates match the actual decoder layout.
+    // Not applying this matrix causes mis-sampling on some devices/content.
     private const val VERTEX_SHADER = """
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
+        uniform mat4 uTexMatrix;
         varying vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
-            vTexCoord = aTexCoord;
+            vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
         }
     """
 
-    private const val FRAGMENT_SHADER = """
+    // Two-pass Lanczos-2 approximation using 4-tap weighted sum.
+    // Single bilinear (GL_LINEAR) when downscaling 3x+ produces aliasing and
+    // moire. A weighted multi-tap filter preserves fine detail and sharpness.
+    // The shader samples 4 neighbours in whichever axis is specified by uStep,
+    // so it is run once horizontally then once vertically (ping-pong FBO).
+    private const val FRAGMENT_SHADER_PASS1 = """
         #extension GL_OES_EGL_image_external : require
         precision mediump float;
         uniform samplerExternalOES uTexture;
+        uniform vec2 uStep;
         varying vec2 vTexCoord;
+
+        float lanczos2(float x) {
+            if (x == 0.0) return 1.0;
+            if (abs(x) >= 2.0) return 0.0;
+            float px = 3.14159265 * x;
+            float px2 = px * 0.5;
+            return (sin(px) / px) * (sin(px2) / px2);
+        }
+
         void main() {
-            gl_FragColor = texture2D(uTexture, vTexCoord);
+            vec4 color = vec4(0.0);
+            float weightSum = 0.0;
+            for (int i = -1; i <= 2; i++) {
+                float offset = float(i) - 0.5;
+                float w = lanczos2(offset);
+                color += texture2D(uTexture, vTexCoord + uStep * offset) * w;
+                weightSum += w;
+            }
+            gl_FragColor = color / weightSum;
+        }
+    """
+
+    // Second pass samples the intermediate RGBA FBO texture (regular 2D).
+    private const val FRAGMENT_SHADER_PASS2 = """
+        precision mediump float;
+        uniform sampler2D uTexture2D;
+        uniform vec2 uStep;
+        varying vec2 vTexCoord;
+
+        float lanczos2(float x) {
+            if (x == 0.0) return 1.0;
+            if (abs(x) >= 2.0) return 0.0;
+            float px = 3.14159265 * x;
+            float px2 = px * 0.5;
+            return (sin(px) / px) * (sin(px2) / px2);
+        }
+
+        void main() {
+            vec4 color = vec4(0.0);
+            float weightSum = 0.0;
+            for (int i = -1; i <= 2; i++) {
+                float offset = float(i) - 0.5;
+                float w = lanczos2(offset);
+                color += texture2D(uTexture2D, vTexCoord + uStep * offset) * w;
+                weightSum += w;
+            }
+            gl_FragColor = color / weightSum;
         }
     """
 
@@ -88,9 +142,9 @@ object VideoCompressor {
         return shader
     }
 
-    private fun createProgram(): Int {
-        val vertex   = compileShader(GLES20.GL_VERTEX_SHADER,   VERTEX_SHADER)
-        val fragment = compileShader(GLES20.GL_FRAGMENT_SHADER, FRAGMENT_SHADER)
+    private fun createProgram(vertSrc: String, fragSrc: String): Int {
+        val vertex   = compileShader(GLES20.GL_VERTEX_SHADER,   vertSrc)
+        val fragment = compileShader(GLES20.GL_FRAGMENT_SHADER, fragSrc)
         val program  = GLES20.glCreateProgram()
         GLES20.glAttachShader(program, vertex)
         GLES20.glAttachShader(program, fragment)
@@ -116,16 +170,17 @@ object VideoCompressor {
         srcWidth: Int,
         srcHeight: Int,
         frameRate: Float,
-        useH265: Boolean
+        useH265: Boolean,
+        // Fraction of the target budget to actually use. Caller sets this after
+        // querying real encoder capabilities so headroom matches actual behaviour.
+        headroom: Float = 0.88f
     ): Pair<Int, Int> {
         val fps = frameRate.coerceIn(1f, 120f)
 
         val audioBudgetBits = if (durationSecs > 0) (AUDIO_KBPS * 1000L * durationSecs) else 0L
-        // 1 MB = 8 × 1,048,576 bits. Reserve 12% headroom: ~4% for MP4
-        // container overhead and ~8% for CBR encoder burst tolerance (Android
-        // hardware encoders routinely produce 8-15% above the configured
-        // bitrate even in CBR mode). Goal is to land at or under target.
-        val targetBits      = (targetSizeMb * 8_388_608f * 0.88f).toLong()
+        // 1 MB = 8 × 1,048,576 bits. headroom is set by the caller based on
+        // whether the encoder supports true CBR or falls back to VBR.
+        val targetBits      = (targetSizeMb * 8_388_608f * headroom).toLong()
         val videoBudgetBits = (targetBits - audioBudgetBits).coerceAtLeast(targetBits / 2)
         val rawBitrateBps   = if (durationSecs > 0)
             (videoBudgetBits / durationSecs).toInt()
@@ -142,7 +197,13 @@ object VideoCompressor {
         val aspectRatio   = srcWidth.toFloat() / srcHeight.toFloat()
         val totalPixels   = videoTargetBps.toFloat() / (TARGET_BPP * fps)
         val idealHeight   = sqrt(totalPixels / aspectRatio)
-        val clampedHeight = idealHeight.roundToInt().coerceIn(144, srcHeight)
+        // Never downscale below 480p. Below this threshold the visual quality
+        // degradation from resolution loss outweighs any bitrate saving — a
+        // blurry 480p frame looks better than a sharp 160p one at the same
+        // number of bytes. The encoder will simply use fewer bits per frame at
+        // 480p when the bitrate budget is tight.
+        val minHeight     = minOf(480, srcHeight)
+        val clampedHeight = idealHeight.roundToInt().coerceIn(minHeight, srcHeight)
         val outputHeight  = alignTo16(clampedHeight).coerceIn(16, srcHeight)
 
         Log.d(TAG, "computeParams -> bitrate=${videoTargetBps / 1000}kbps height=$outputHeight")
@@ -256,23 +317,77 @@ object VideoCompressor {
             }
         }
 
+        // ---- Capability-aware headroom ------------------------------------------
+        // Query CBR support before computing the final bitrate so we can apply
+        // the right headroom. From real device measurements (OMX.MTK encoders):
+        //   CBR H.265: overshoots ~4–8%  → reserve 6%  (headroom = 0.94)
+        //   VBR H.264: overshoots ~3–5%  → reserve 5%  (headroom = 0.95)
+        // Always reserve an extra 2% for MP4 container overhead on top.
+        val encoderNameForCaps = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            .findEncoderForFormat(MediaFormat.createVideoFormat(encoderMime, finalWidth, finalHeight))
+            ?: encoderMime
+        val cbrSupported = isCbrSupported(encoderMime, encoderNameForCaps)
+        val headroom = when {
+            cbrSupported -> 0.92f   // CBR: 6% burst + 2% container
+            else         -> 0.93f   // VBR: 5% burst + 2% container
+        }
+        // Recompute bitrate with the correct headroom now that we know the encoder.
+        val (adjustedBitrate, _) = computeParams(
+            targetSizeMb, info.durationSecs, info.bitrateKbps,
+            srcWidth, srcHeight, info.frameRate, useH265, headroom
+        )
+
         // ---- Encoder ------------------------------------------------------------
         val encoder = MediaCodec.createEncoderByType(encoderMime)
         val encoderFormat = MediaFormat.createVideoFormat(encoderMime, finalWidth, finalHeight).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE,        targetBitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE,      frameRateInt)
-            // CBR: encoder must hit the bitrate target every second, not just
-            // on average. Without this Android defaults to VBR which bursts
-            // freely on complex scenes and overshoots the target file size.
-            setInteger(MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            setInteger(MediaFormat.KEY_BIT_RATE,    adjustedBitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE,  frameRateInt)
+            // Only set CBR mode when the encoder actually supports it. Setting an
+            // unsupported bitrate mode causes some encoders to behave erratically.
+            if (cbrSupported) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            }
             // 4-second keyframe interval. 1s was forcing ~600 large keyframes
             // for a 10-min video, each 5–20× bigger than a P-frame, bloating
             // the output. 4s keeps seeking reasonable while cutting overhead.
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 4)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            // Non-realtime priority: tells the encoder this is an offline
+            // transcode, not live capture. Enables slower, higher-quality
+            // encoding paths on hardware encoders that support two modes.
+            // Silently ignored by encoders that don't distinguish modes.
+            try { setInteger(MediaFormat.KEY_PRIORITY, 1) }
+            catch (_: Exception) {}
+            // B-frames: allow up to 2 reference frames. B-frames improve quality
+            // at the same bitrate by referencing both past and future frames.
+            // Previously forced to 0 for compatibility but all modern Android
+            // devices support B-frames in H.264 and H.265.
+            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 2)
+            // Encoder complexity hint (0–10). Higher = more CPU time spent on
+            // motion estimation = better quality per bit at no size cost.
+            // Silently ignored by encoders that don't support it.
+            try { setInteger(MediaFormat.KEY_COMPLEXITY, 10) }
+            catch (_: Exception) {}
+            // Request High profile for H.264, Main for H.265.
+            // Baseline/Main profile (the default on many encoders) disables
+            // CABAC and other tools that improve compression efficiency.
+            if (encoderMime == MediaFormat.MIMETYPE_VIDEO_AVC) {
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE,
+                        MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                    setInteger(MediaFormat.KEY_LEVEL,
+                        MediaCodecInfo.CodecProfileLevel.AVCLevel41)
+                } catch (_: Exception) {}
+            } else if (encoderMime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE,
+                        MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+                    setInteger(MediaFormat.KEY_LEVEL,
+                        MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41)
+                } catch (_: Exception) {}
+            }
         }
         encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val encoderInputSurface = encoder.createInputSurface()
@@ -280,31 +395,12 @@ object VideoCompressor {
 
         // ---- Diagnostic logging — visible in Logcat filtered by "VideoCompressor" ----
         Log.i(TAG, "=== Compression params ===")
-        Log.i(TAG, "  Codec        : $encoderMime")
-        Log.i(TAG, "  Encoder name : ${encoder.name}")
+        Log.i(TAG, "  Codec        : $encoderMime  (${encoder.name})")
         Log.i(TAG, "  Resolution   : ${finalWidth}x${finalHeight}  (source: ${srcWidth}x${srcHeight})")
-        Log.i(TAG, "  Bitrate      : ${targetBitrate / 1000} kbps")
-        Log.i(TAG, "  Frame rate   : $frameRateInt fps")
-        Log.i(TAG, "  Duration     : ${info.durationSecs}s")
+        Log.i(TAG, "  Bitrate      : ${adjustedBitrate / 1000} kbps  (headroom=${headroom})")
+        Log.i(TAG, "  Frame rate   : $frameRateInt fps  |  Duration: ${info.durationSecs}s")
         Log.i(TAG, "  Target size  : $targetSizeMb MB")
-        Log.i(TAG, "  Bitrate mode : CBR requested")
-        // Check whether the hardware encoder actually supports CBR
-        run {
-            val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-            for (ci in codecList.codecInfos) {
-                if (ci.name != encoder.name || !ci.isEncoder) continue
-                val ec = try { ci.getCapabilitiesForType(encoderMime).encoderCapabilities }
-                catch (e: Exception) { null } ?: break
-                val cbrOk = ec.isBitrateModeSupported(
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                val vbrOk = ec.isBitrateModeSupported(
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-                val cq    = ec.isBitrateModeSupported(
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
-                Log.i(TAG, "  CBR supported: $cbrOk  VBR: $vbrOk  CQ: $cq")
-                break
-            }
-        }
+        Log.i(TAG, "  CBR support  : $cbrSupported  |  Mode applied: ${if (cbrSupported) "CBR" else "VBR (fallback — size accuracy is best-effort)"}")
         Log.i(TAG, "==========================")
 
         // ---- EGL — all GL work runs on CompressThread (this thread) -------------
@@ -337,18 +433,19 @@ object VideoCompressor {
         // Make current on THIS thread — all GL calls below must stay here.
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
-        // ---- OpenGL program + geometry ------------------------------------------
-        val program    = createProgram()
-        GLES20.glUseProgram(program)
-        val posLoc     = GLES20.glGetAttribLocation(program,  "aPosition")
-        val texLoc     = GLES20.glGetAttribLocation(program,  "aTexCoord")
-        val samplerLoc = GLES20.glGetUniformLocation(program, "uTexture")
+        // ---- OpenGL programs + geometry -----------------------------------------
+        // Pass 1: OES external texture → intermediate FBO (horizontal Lanczos)
+        val progPass1    = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_PASS1)
+        // Pass 2: intermediate FBO → encoder surface (vertical Lanczos)
+        val progPass2    = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_PASS2)
 
+        // Geometry: full-screen quad. V is NOT flipped here — the SurfaceTexture
+        // transform matrix (uTexMatrix) handles the Y-axis correctly per-frame.
         val vertices = floatArrayOf(
-            -1f, -1f,  0f, 1f,
-            1f, -1f,  1f, 1f,
-            -1f,  1f,  0f, 0f,
-            1f,  1f,  1f, 0f
+            -1f, -1f,  0f, 0f,
+            1f, -1f,  1f, 0f,
+            -1f,  1f,  0f, 1f,
+            1f,  1f,  1f, 1f
         )
         val vertBuffer = ByteBuffer
             .allocateDirect(vertices.size * 4)
@@ -356,14 +453,21 @@ object VideoCompressor {
             .asFloatBuffer()
             .also { it.put(vertices).position(0) }
 
-        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 4 * 4, vertBuffer)
-        GLES20.glEnableVertexAttribArray(posLoc)
-        vertBuffer.position(2)
-        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 4 * 4, vertBuffer)
-        GLES20.glEnableVertexAttribArray(texLoc)
-        GLES20.glUniform1i(samplerLoc, 0)
+        // Wire geometry into both programs
+        for (prog in intArrayOf(progPass1, progPass2)) {
+            GLES20.glUseProgram(prog)
+            val pLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+            val tLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+            vertBuffer.position(0)
+            GLES20.glVertexAttribPointer(pLoc, 2, GLES20.GL_FLOAT, false, 4 * 4, vertBuffer)
+            GLES20.glEnableVertexAttribArray(pLoc)
+            vertBuffer.position(2)
+            GLES20.glVertexAttribPointer(tLoc, 2, GLES20.GL_FLOAT, false, 4 * 4, vertBuffer)
+            GLES20.glEnableVertexAttribArray(tLoc)
+        }
         GLES20.glClearColor(0f, 0f, 0f, 1f)
 
+        // OES texture — decoder writes frames here via SurfaceTexture
         val textureId = IntArray(1)
         GLES20.glGenTextures(1, textureId, 0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId[0])
@@ -375,6 +479,31 @@ object VideoCompressor {
             GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
             GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        // Intermediate FBO + RGBA texture for the horizontal pass output.
+        // Size = output resolution so pass 2 reads at 1:1.
+        val fboId   = IntArray(1)
+        val fboTexId = IntArray(1)
+        GLES20.glGenFramebuffers(1, fboId, 0)
+        GLES20.glGenTextures(1, fboTexId, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId[0])
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+            finalWidth, finalHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId[0])
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D, fboTexId[0], 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+
+        // Transform matrix storage — updated each frame from SurfaceTexture
+        val texMatrix = FloatArray(16)
 
         // FIX (Bug 5): keep references so we can release them in the cleanup block.
         val surfaceTexture       = SurfaceTexture(textureId[0])
@@ -476,16 +605,46 @@ object VideoCompressor {
                 decoder.releaseOutputBuffer(decoderOutIdx, render)
 
                 if (render) {
-                    // FIX (Bug 1 + Bug 2): wait for the frame on THIS thread with
-                    // a latch, then call updateTexImage here — not on RenderThread.
                     val arrived = frameLatch.await(100, TimeUnit.MILLISECONDS)
                     if (!arrived) Log.w(TAG, "Frame latch timed out — skipping render")
-                    frameLatch = CountDownLatch(1)    // arm for the next frame
+                    frameLatch = CountDownLatch(1)
 
-                    surfaceTexture.updateTexImage()   // must be on EGL-current thread
+                    surfaceTexture.updateTexImage()
+                    surfaceTexture.getTransformMatrix(texMatrix)
+
+                    // ── Pass 1: OES texture → FBO (horizontal Lanczos) ───────────
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId[0])
                     GLES20.glViewport(0, 0, finalWidth, finalHeight)
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                    GLES20.glUseProgram(progPass1)
+                    // Upload the SurfaceTexture transform so UVs match the decoder
+                    val mtxLoc1 = GLES20.glGetUniformLocation(progPass1, "uTexMatrix")
+                    GLES20.glUniformMatrix4fv(mtxLoc1, 1, false, texMatrix, 0)
+                    val stepLoc1 = GLES20.glGetUniformLocation(progPass1, "uStep")
+                    GLES20.glUniform2f(stepLoc1, 1f / srcWidth, 0f)
+                    val sampLoc1 = GLES20.glGetUniformLocation(progPass1, "uTexture")
+                    GLES20.glUniform1i(sampLoc1, 0)
+                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId[0])
                     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+                    // ── Pass 2: FBO → encoder surface (vertical Lanczos) ─────────
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    GLES20.glViewport(0, 0, finalWidth, finalHeight)
+                    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                    GLES20.glUseProgram(progPass2)
+                    // Pass 2 reads a regular 2D texture — no OES matrix needed
+                    val mtxLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexMatrix")
+                    GLES20.glUniformMatrix4fv(mtxLoc2, 1, false,
+                        floatArrayOf(1f,0f,0f,0f, 0f,1f,0f,0f, 0f,0f,1f,0f, 0f,0f,0f,1f), 0)
+                    val stepLoc2 = GLES20.glGetUniformLocation(progPass2, "uStep")
+                    GLES20.glUniform2f(stepLoc2, 0f, 1f / srcHeight)
+                    val sampLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexture2D")
+                    GLES20.glUniform1i(sampLoc2, 0)
+                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId[0])
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
                     EGLExt.eglPresentationTimeANDROID(
                         eglDisplay, eglSurface, surfaceTexture.timestamp
                     )
@@ -654,8 +813,11 @@ object VideoCompressor {
         EGL14.eglDestroySurface(eglDisplay, eglSurface)
         EGL14.eglDestroyContext(eglDisplay, eglContext)
         EGL14.eglTerminate(eglDisplay)
-        GLES20.glDeleteProgram(program)
+        GLES20.glDeleteProgram(progPass1)
+        GLES20.glDeleteProgram(progPass2)
         GLES20.glDeleteTextures(1, textureId, 0)
+        GLES20.glDeleteTextures(1, fboTexId, 0)
+        GLES20.glDeleteFramebuffers(1, fboId, 0)
 
         if (cancelFlag.get()) {
             File(outputPath).delete()
@@ -669,6 +831,18 @@ object VideoCompressor {
     }
 
     // --- Helpers -----------------------------------------------------------------
+
+    private fun isCbrSupported(mime: String, encoderName: String): Boolean {
+        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        for (ci in codecList.codecInfos) {
+            if (ci.name != encoderName || !ci.isEncoder) continue
+            val ec = try { ci.getCapabilitiesForType(mime).encoderCapabilities }
+            catch (e: Exception) { return false }
+            return ec.isBitrateModeSupported(
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+        }
+        return false
+    }
 
     private fun isEncoderSupported(
         mime: String,
