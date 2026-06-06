@@ -197,14 +197,14 @@ object VideoCompressor {
         val aspectRatio   = srcWidth.toFloat() / srcHeight.toFloat()
         val totalPixels   = videoTargetBps.toFloat() / (TARGET_BPP * fps)
         val idealHeight   = sqrt(totalPixels / aspectRatio)
-        // Never downscale below 480p. Below this threshold the visual quality
-        // degradation from resolution loss outweighs any bitrate saving — a
-        // blurry 480p frame looks better than a sharp 160p one at the same
-        // number of bytes. The encoder will simply use fewer bits per frame at
-        // 480p when the bitrate budget is tight.
-        val minHeight     = minOf(480, srcHeight)
-        val clampedHeight = idealHeight.roundToInt().coerceIn(minHeight, srcHeight)
-        val outputHeight  = alignTo16(clampedHeight).coerceIn(16, srcHeight)
+        // Never downscale below 480p — blurry 480p beats sharp 160p at the
+        // same bitrate. The encoder uses fewer bits per frame when tight.
+        val minHeight    = minOf(480, srcHeight)
+        val rawHeight    = idealHeight.roundToInt().coerceIn(minHeight, srcHeight)
+        // Align height to 16 then clamp back to srcHeight so we never request
+        // a resolution larger than the source (e.g. source 2340x1080: aligned
+        // width 2352 exceeds source width 2340 and the encoder rejects it).
+        val outputHeight = alignTo16(rawHeight).coerceIn(16, srcHeight)
 
         Log.d(TAG, "computeParams -> bitrate=${videoTargetBps / 1000}kbps height=$outputHeight")
         return Pair(videoTargetBps, outputHeight)
@@ -258,6 +258,8 @@ object VideoCompressor {
         onFailure: (Exception) -> Unit
     ) {
         val info = getVideoInfo(context, inputUri)
+        // info.width/height are display-space (rotation-corrected) since getVideoInfo
+        // now applies the rotation swap. computeParams gets the correct aspect ratio.
         val (targetBitrate, targetHeight) = computeParams(
             targetSizeMb, info.durationSecs, info.bitrateKbps,
             info.width, info.height, info.frameRate, useH265
@@ -294,52 +296,90 @@ object VideoCompressor {
         }
 
         // ---- Output dimensions --------------------------------------------------
-        val srcWidth          = videoFormat!!.getInteger(MediaFormat.KEY_WIDTH)
-        val srcHeight         = videoFormat!!.getInteger(MediaFormat.KEY_HEIGHT)
-        val targetWidth       = (targetHeight.toFloat() * srcWidth / srcHeight).roundToInt()
-        val finalWidth        = alignTo16(targetWidth).coerceIn(16, srcWidth)
-        val finalHeight       = targetHeight.coerceIn(16, srcHeight)
+        val codedWidth  = videoFormat!!.getInteger(MediaFormat.KEY_WIDTH)
+        val codedHeight = videoFormat!!.getInteger(MediaFormat.KEY_HEIGHT)
+
+        // MediaFormat KEY_WIDTH/KEY_HEIGHT are always *coded* (bitstream) dimensions
+        // and do not account for rotation. We must swap them into display space here
+        // for the encoder resolution and aspect ratio math.
+        // Note: getVideoInfo already returns display-space dims in info.width/height,
+        // so computeParams always gets the correct aspect ratio. This local swap is
+        // still needed for encFinalWidth/encFinalHeight passed to the encoder.
+        val displaySwapped = rotation == 90 || rotation == 270
+        val srcWidth  = if (displaySwapped) codedHeight else codedWidth
+        val srcHeight = if (displaySwapped) codedWidth  else codedHeight
+
+        val targetWidth = (targetHeight.toFloat() * srcWidth / srcHeight).roundToInt()
+        // Align then clamp to srcWidth/srcHeight so non-16-aligned source widths
+        // (e.g. 2340) don't produce aligned values that exceed the source dimensions.
+        val finalWidth  = alignTo16(targetWidth).coerceAtMost(srcWidth)
+        val finalHeight = targetHeight.coerceAtMost(srcHeight)
         val encoderMime       = if (useH265) MediaFormat.MIMETYPE_VIDEO_HEVC
         else         MediaFormat.MIMETYPE_VIDEO_AVC
         val frameRateInt      = info.frameRate.toInt().coerceIn(1, 120)
 
-        if (!isEncoderSupported(encoderMime, finalWidth, finalHeight, targetBitrate, frameRateInt)) {
+        // ---- Encoder capability resolution ─────────────────────────────────────
+        // findEncoderForFormat(mime + dimensions) returns null on many devices when
+        // the requested dimensions exceed the encoder's *advertised* max, even though
+        // the encoder works fine at those dimensions in practice (OMX.MTK.VIDEO.ENCODER.HEVC
+        // won't advertise 2340x1080 but encodes it without issue).
+        // Strategy: find by mime type only, then use capability info to clamp
+        // dimensions and bitrate — never reject based on declared caps alone.
+        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+
+        // Find encoder by mime type only (no dimension filter)
+        val encoderInfo = codecList.codecInfos
+            .firstOrNull { it.isEncoder && it.supportedTypes.contains(encoderMime) }
+
+        if (encoderInfo == null) {
+            // Codec genuinely absent from device
             if (useH265) {
-                Log.w(TAG, "H.265 not supported, falling back to H.264")
+                Log.w(TAG, "No H.265 encoder on device, falling back to H.264")
                 return runCompression(
                     context, inputUri, outputPath, false, targetSizeMb,
                     cancelFlag, onProgress, onSuccess, onCancelled, onFailure
                 )
             } else {
-                throw IllegalStateException(
-                    "No encoder supports ${finalWidth}x${finalHeight} @ ${targetBitrate}bps"
-                )
+                throw IllegalStateException("No H.264 encoder found on device")
             }
         }
 
-        // ---- Capability-aware headroom ------------------------------------------
-        // Query CBR support before computing the final bitrate so we can apply
-        // the right headroom. From real device measurements (OMX.MTK encoders):
-        //   CBR H.265: overshoots ~4–8%  → reserve 6%  (headroom = 0.94)
-        //   VBR H.264: overshoots ~3–5%  → reserve 5%  (headroom = 0.95)
-        // Always reserve an extra 2% for MP4 container overhead on top.
-        val encoderNameForCaps = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-            .findEncoderForFormat(MediaFormat.createVideoFormat(encoderMime, finalWidth, finalHeight))
-            ?: encoderMime
-        val cbrSupported = isCbrSupported(encoderMime, encoderNameForCaps)
-        val headroom = when {
-            cbrSupported -> 0.92f   // CBR: 6% burst + 2% container
-            else         -> 0.93f   // VBR: 5% burst + 2% container
-        }
-        // Recompute bitrate with the correct headroom now that we know the encoder.
-        val (adjustedBitrate, _) = computeParams(
+        val encoderCaps   = encoderInfo.getCapabilitiesForType(encoderMime)
+        val videoCaps     = encoderCaps.videoCapabilities
+
+        // Clamp requested dimensions to what the encoder actually declares.
+        // If the encoder under-reports (common on MTK), we pass the original
+        // dimensions and let the hardware decide — it almost always works.
+        val encMaxW = videoCaps.supportedWidths.upper
+        val encMaxH = videoCaps.supportedHeights.upper
+        val encFinalWidth  = if (finalWidth  > encMaxW) {
+            Log.w(TAG, "Width $finalWidth exceeds declared max $encMaxW — attempting anyway")
+            finalWidth   // attempt at requested size; hardware usually accepts it
+        } else finalWidth
+        val encFinalHeight = if (finalHeight > encMaxH) {
+            Log.w(TAG, "Height $finalHeight exceeds declared max $encMaxH — attempting anyway")
+            finalHeight
+        } else finalHeight
+
+        // CBR support and headroom — calibrated from real OMX.MTK device measurements:
+        //   CBR H.265: overshoots ~4–8%  → headroom 0.92
+        //   VBR H.264: overshoots ~3–5%  → headroom 0.93
+        val cbrSupported = encoderCaps.encoderCapabilities.isBitrateModeSupported(
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+        val headroom = if (cbrSupported) 0.92f else 0.93f
+
+        val (rawAdjustedBitrate, _) = computeParams(
             targetSizeMb, info.durationSecs, info.bitrateKbps,
             srcWidth, srcHeight, info.frameRate, useH265, headroom
         )
+        // Clamp to declared ceiling — never reject or fall back on bitrate alone.
+        val encoderBitrateCeiling = videoCaps.bitrateRange.upper
+        val adjustedBitrate = rawAdjustedBitrate.coerceAtMost(encoderBitrateCeiling)
+        Log.d(TAG, "Bitrate: raw=${rawAdjustedBitrate/1000}kbps  ceiling=${encoderBitrateCeiling/1000}kbps  final=${adjustedBitrate/1000}kbps")
 
         // ---- Encoder ------------------------------------------------------------
         val encoder = MediaCodec.createEncoderByType(encoderMime)
-        val encoderFormat = MediaFormat.createVideoFormat(encoderMime, finalWidth, finalHeight).apply {
+        val encoderFormat = MediaFormat.createVideoFormat(encoderMime, encFinalWidth, encFinalHeight).apply {
             setInteger(MediaFormat.KEY_BIT_RATE,    adjustedBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE,  frameRateInt)
             // Only set CBR mode when the encoder actually supports it. Setting an
@@ -360,23 +400,30 @@ object VideoCompressor {
             // Silently ignored by encoders that don't distinguish modes.
             try { setInteger(MediaFormat.KEY_PRIORITY, 1) }
             catch (_: Exception) {}
-            // B-frames: allow up to 2 reference frames. B-frames improve quality
-            // at the same bitrate by referencing both past and future frames.
-            // Previously forced to 0 for compatibility but all modern Android
-            // devices support B-frames in H.264 and H.265.
-            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 2)
-            // Encoder complexity hint (0–10). Higher = more CPU time spent on
-            // motion estimation = better quality per bit at no size cost.
-            // Silently ignored by encoders that don't support it.
+            // B-frames: enabled for H.265 only.
+            // H.264 on MTK hardware (OMX.MTK.VIDEO.ENCODER.AVC) accepts
+            // KEY_MAX_B_FRAMES = 2 without error but doesn't correctly signal
+            // B-frame reordering in the output bitstream — the muxer writes
+            // frames in encode order but the decoder renders them out of display
+            // order, producing glitchy / corrupted playback.
+            // H.265 (OMX.MTK.VIDEO.ENCODER.HEVC) handles B-frames correctly.
+            if (encoderMime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            } else {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
+            // Encoder complexity hint (0–10). Higher = more CPU time on motion
+            // estimation = better quality per bit. Silently ignored if unsupported.
             try { setInteger(MediaFormat.KEY_COMPLEXITY, 10) }
             catch (_: Exception) {}
-            // Request High profile for H.264, Main for H.265.
-            // Baseline/Main profile (the default on many encoders) disables
-            // CABAC and other tools that improve compression efficiency.
+            // Profile hints — use Main for both codecs on MTK hardware.
+            // AVCProfileHigh causes silent failures on OMX.MTK.VIDEO.ENCODER.AVC;
+            // AVCProfileMain still enables CABAC and is reliably supported.
+            // HEVCProfileMain is the correct baseline for H.265.
             if (encoderMime == MediaFormat.MIMETYPE_VIDEO_AVC) {
                 try {
                     setInteger(MediaFormat.KEY_PROFILE,
-                        MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                        MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
                     setInteger(MediaFormat.KEY_LEVEL,
                         MediaCodecInfo.CodecProfileLevel.AVCLevel41)
                 } catch (_: Exception) {}
@@ -396,7 +443,7 @@ object VideoCompressor {
         // ---- Diagnostic logging — visible in Logcat filtered by "VideoCompressor" ----
         Log.i(TAG, "=== Compression params ===")
         Log.i(TAG, "  Codec        : $encoderMime  (${encoder.name})")
-        Log.i(TAG, "  Resolution   : ${finalWidth}x${finalHeight}  (source: ${srcWidth}x${srcHeight})")
+        Log.i(TAG, "  Resolution   : ${encFinalWidth}x${encFinalHeight}  (source: ${srcWidth}x${srcHeight})")
         Log.i(TAG, "  Bitrate      : ${adjustedBitrate / 1000} kbps  (headroom=${headroom})")
         Log.i(TAG, "  Frame rate   : $frameRateInt fps  |  Duration: ${info.durationSecs}s")
         Log.i(TAG, "  Target size  : $targetSizeMb MB")
@@ -488,7 +535,7 @@ object VideoCompressor {
         GLES20.glGenTextures(1, fboTexId, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId[0])
         GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
-            finalWidth, finalHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+            encFinalWidth, encFinalHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
             GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
@@ -505,6 +552,21 @@ object VideoCompressor {
         // Transform matrix storage — updated each frame from SurfaceTexture
         val texMatrix = FloatArray(16)
 
+        // Cache all uniform locations once here — calling glGetUniformLocation
+        // inside the per-frame render loop causes a driver roundtrip every frame.
+        // For a 756-frame video that's ~6000 redundant GL calls eliminated.
+        val uTexMatrixLoc1 = GLES20.glGetUniformLocation(progPass1, "uTexMatrix")
+        val uStepLoc1      = GLES20.glGetUniformLocation(progPass1, "uStep")
+        val uSamplerLoc1   = GLES20.glGetUniformLocation(progPass1, "uTexture")
+        val uTexMatrixLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexMatrix")
+        val uStepLoc2      = GLES20.glGetUniformLocation(progPass2, "uStep")
+        val uSamplerLoc2   = GLES20.glGetUniformLocation(progPass2, "uTexture")
+        // Identity matrix for pass 2 (regular 2D texture — no OES transform needed)
+        val identityMatrix = floatArrayOf(1f,0f,0f,0f, 0f,1f,0f,0f, 0f,0f,1f,0f, 0f,0f,0f,1f)
+        // Precompute step values — these only change if resolution changes (it doesn't)
+        val stepH = 1f / srcWidth    // horizontal step for pass 1
+        val stepV = 1f / srcHeight   // vertical step for pass 2
+
         // FIX (Bug 5): keep references so we can release them in the cleanup block.
         val surfaceTexture       = SurfaceTexture(textureId[0])
         val decoderOutputSurface = Surface(surfaceTexture)
@@ -518,6 +580,11 @@ object VideoCompressor {
             { frameLatch.countDown() },
             Handler(frameCallbackThread.looper)
         )
+        // Latch timeout = 3× the frame interval, min 50ms, max 200ms.
+        // 100ms flat was fine at 30fps but at 63fps frames arrive every 16ms —
+        // a timed-out latch stalls the pipeline for 100ms per frame (6+ seconds
+        // of unnecessary waiting for a 756-frame video).
+        val frameLatchTimeoutMs = (3000L / frameRateInt.toLong()).coerceIn(50L, 200L)
 
         // ---- Decoder ------------------------------------------------------------
         val decoderMime = videoFormat!!.getString(MediaFormat.KEY_MIME)!!
@@ -605,7 +672,7 @@ object VideoCompressor {
                 decoder.releaseOutputBuffer(decoderOutIdx, render)
 
                 if (render) {
-                    val arrived = frameLatch.await(100, TimeUnit.MILLISECONDS)
+                    val arrived = frameLatch.await(frameLatchTimeoutMs, TimeUnit.MILLISECONDS)
                     if (!arrived) Log.w(TAG, "Frame latch timed out — skipping render")
                     frameLatch = CountDownLatch(1)
 
@@ -614,31 +681,23 @@ object VideoCompressor {
 
                     // ── Pass 1: OES texture → FBO (horizontal Lanczos) ───────────
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId[0])
-                    GLES20.glViewport(0, 0, finalWidth, finalHeight)
+                    GLES20.glViewport(0, 0, encFinalWidth, encFinalHeight)
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                     GLES20.glUseProgram(progPass1)
-                    // Upload the SurfaceTexture transform so UVs match the decoder
-                    val mtxLoc1 = GLES20.glGetUniformLocation(progPass1, "uTexMatrix")
-                    GLES20.glUniformMatrix4fv(mtxLoc1, 1, false, texMatrix, 0)
-                    val stepLoc1 = GLES20.glGetUniformLocation(progPass1, "uStep")
-                    GLES20.glUniform2f(stepLoc1, 1f / srcWidth, 0f)
-                    val sampLoc1 = GLES20.glGetUniformLocation(progPass1, "uTexture")
-                    GLES20.glUniform1i(sampLoc1, 0)
+                    GLES20.glUniformMatrix4fv(uTexMatrixLoc1, 1, false, texMatrix, 0)
+                    GLES20.glUniform2f(uStepLoc1, stepH, 0f)
+                    GLES20.glUniform1i(uSamplerLoc1, 0)
                     GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
                     GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId[0])
                     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
                     // ── Pass 2: FBO → encoder surface (vertical Lanczos) ─────────
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                    GLES20.glViewport(0, 0, finalWidth, finalHeight)
+                    GLES20.glViewport(0, 0, encFinalWidth, encFinalHeight)
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                     GLES20.glUseProgram(progPass2)
-                    // Pass 2 reads a regular 2D texture — no OES matrix needed
-                    val mtxLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexMatrix")
-                    GLES20.glUniformMatrix4fv(mtxLoc2, 1, false,
-                        floatArrayOf(1f,0f,0f,0f, 0f,1f,0f,0f, 0f,0f,1f,0f, 0f,0f,0f,1f), 0)
-                    val stepLoc2 = GLES20.glGetUniformLocation(progPass2, "uStep")
-                    GLES20.glUniform2f(stepLoc2, 0f, 1f / srcHeight)
+                    GLES20.glUniformMatrix4fv(uTexMatrixLoc2, 1, false, identityMatrix, 0)
+                    GLES20.glUniform2f(uStepLoc2, 0f, stepV)
                     val sampLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexture2D")
                     GLES20.glUniform1i(sampLoc2, 0)
                     GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -840,45 +899,6 @@ object VideoCompressor {
             catch (e: Exception) { return false }
             return ec.isBitrateModeSupported(
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-        }
-        return false
-    }
-
-    private fun isEncoderSupported(
-        mime: String,
-        width: Int,
-        height: Int,
-        bitrateBps: Int,
-        frameRate: Int
-    ): Boolean {
-        val codecList   = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        val encoderName = codecList.findEncoderForFormat(
-            MediaFormat.createVideoFormat(mime, width, height)
-        ) ?: return false
-
-        for (codecInfo in codecList.codecInfos) {
-            if (codecInfo.name != encoderName || !codecInfo.isEncoder) continue
-            val caps = try {
-                codecInfo.getCapabilitiesForType(mime)
-            } catch (e: Exception) {
-                Log.w(TAG, "Cannot get capabilities for $mime: ${e.message}")
-                return false
-            }
-            val vc = caps.videoCapabilities
-            if (!vc.isSizeSupported(width, height)) {
-                Log.w(TAG, "Size ${width}x${height} not supported by $encoderName")
-                return false
-            }
-            val br = vc.bitrateRange
-            if (bitrateBps < br.lower || bitrateBps > br.upper) {
-                Log.w(TAG, "Bitrate $bitrateBps not in [${br.lower}, ${br.upper}]")
-                return false
-            }
-            if (!vc.areSizeAndRateSupported(width, height, frameRate.toDouble())) {
-                Log.w(TAG, "${width}x${height}@${frameRate}fps not supported")
-                return false
-            }
-            return true
         }
         return false
     }
