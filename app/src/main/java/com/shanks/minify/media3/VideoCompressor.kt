@@ -12,16 +12,17 @@ import android.media.MediaMuxer
 import android.net.Uri
 import android.opengl.EGL14
 import android.opengl.EGLConfig
-import android.opengl.EGLContext
-import android.opengl.EGLDisplay
 import android.opengl.EGLExt
-import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
+import com.shanks.minify.ui.CodecChoice
+import com.shanks.minify.ui.CropRect
+import com.shanks.minify.ui.EditState
 import com.shanks.minify.utils.getVideoInfo
 import java.io.File
 import java.nio.ByteBuffer
@@ -29,6 +30,7 @@ import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -46,122 +48,168 @@ class CompressionJob(
 object VideoCompressor {
     private const val TAG = "VideoCompressor"
     private const val AUDIO_KBPS = 128
-    private const val TARGET_BPP = 0.15f
     private const val ABS_FLOOR_BPS = 50_000
     private const val ABS_CEILING_BPS = 25_000_000
 
-    // --- Shaders -----------------------------------------------------------------
-    // Vertex shader passes through position and applies the SurfaceTexture
-    // transform matrix so texture coordinates match the actual decoder layout.
-    // Not applying this matrix causes mis-sampling on some devices/content.
+    // ── Vertex shader ─────────────────────────────────────────────────────────
     private const val VERTEX_SHADER = """
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
-        uniform mat4 uTexMatrix;
         varying vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
-            vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
+            vTexCoord = aTexCoord;
         }
     """
 
-    // Two-pass Lanczos-2 approximation using 4-tap weighted sum.
-    // Single bilinear (GL_LINEAR) when downscaling 3x+ produces aliasing and
-    // moire. A weighted multi-tap filter preserves fine detail and sharpness.
-    // The shader samples 4 neighbours in whichever axis is specified by uStep,
-    // so it is run once horizontally then once vertically (ping-pong FBO).
-    private const val FRAGMENT_SHADER_PASS1 = """
-        #extension GL_OES_EGL_image_external : require
-        precision mediump float;
-        uniform samplerExternalOES uTexture;
-        uniform vec2 uStep;
-        varying vec2 vTexCoord;
+    // ── Pass A: Box pre-filter (OES → FBO-A, source size) ────────────────────
+    private const val FRAGMENT_SHADER_BOX = """
+    #extension GL_OES_EGL_image_external : require
+    precision mediump float;
+    uniform samplerExternalOES uTexture;
+    uniform mat4  uTexMatrix;
+    uniform vec2  uStepSrc;
+    uniform float uTapX;
+    uniform float uTapY;
+    uniform vec2  uCropOrigin;   // left, top  – in UI space (0..1)
+    uniform vec2  uCropSize;     // width, height (positive)
+    varying vec2 vTexCoord;
 
-        float lanczos2(float x) {
-            if (x == 0.0) return 1.0;
-            if (abs(x) >= 2.0) return 0.0;
-            float px = 3.14159265 * x;
-            float px2 = px * 0.5;
-            return (sin(px) / px) * (sin(px2) / px2);
-        }
+    void main() {
+        vec4  sum   = vec4(0.0);
+        float count = 0.0;
+        float startX = -(uTapX - 1.0) * 0.5;
+        float startY = -(uTapY - 1.0) * 0.5;
 
-        void main() {
-            vec4 color = vec4(0.0);
-            float weightSum = 0.0;
-            for (int i = -1; i <= 2; i++) {
-                float offset = float(i) - 0.5;
-                float w = lanczos2(offset);
-                color += texture2D(uTexture, vTexCoord + uStep * offset) * w;
-                weightSum += w;
+        for (float x = 0.0; x < 8.0; x++) {
+            if (x >= uTapX) break;
+            for (float y = 0.0; y < 8.0; y++) {
+                if (y >= uTapY) break;
+
+                // 1. Map the fragment's V coordinate (bottom‑up) to UI Y (top‑down)
+                vec2 uiCoord = vec2(
+                    uCropOrigin.x + vTexCoord.x * uCropSize.x,
+                    uCropOrigin.y + (1.0 - vTexCoord.y) * uCropSize.y
+                );
+
+                // 2. Add box‑filter offset (still in UI space)
+                uiCoord += vec2(startX + x, startY + y) * uStepSrc;
+
+                // 3. Clamp to the crop rectangle (UI space)
+                vec2 cropMax = uCropOrigin + uCropSize;
+                uiCoord = clamp(uiCoord, uCropOrigin, cropMax);
+
+                // 4. **Convert to OpenGL texture space** (flip Y)
+                vec2 glCoord = vec2(uiCoord.x, 1.0 - uiCoord.y);
+
+                // 5. Apply the OES texture matrix (expects GL coords)
+                vec2 texCoord = (uTexMatrix * vec4(glCoord, 0.0, 1.0)).xy;
+
+                sum   += texture2D(uTexture, texCoord);
+                count += 1.0;
             }
-            gl_FragColor = color / weightSum;
         }
-    """
+        gl_FragColor = sum / count;
+    }
+"""
 
-    // Second pass samples the intermediate RGBA FBO texture (regular 2D).
-    private const val FRAGMENT_SHADER_PASS2 = """
+    // ── Pass B: Horizontal Lanczos-2 (FBO-A → FBO-B, output size) ────────────
+    private const val FRAGMENT_SHADER_LANCZOS_H = """
         precision mediump float;
         uniform sampler2D uTexture2D;
+        uniform mat4  uTexMatrix; // Unused but kept for program consistency if needed
         uniform vec2 uStep;
         varying vec2 vTexCoord;
 
         float lanczos2(float x) {
             if (x == 0.0) return 1.0;
             if (abs(x) >= 2.0) return 0.0;
-            float px = 3.14159265 * x;
+            float px  = 3.14159265 * x;
             float px2 = px * 0.5;
             return (sin(px) / px) * (sin(px2) / px2);
         }
 
         void main() {
-            vec4 color = vec4(0.0);
-            float weightSum = 0.0;
+            vec4  color = vec4(0.0); float ws = 0.0;
             for (int i = -1; i <= 2; i++) {
-                float offset = float(i) - 0.5;
-                float w = lanczos2(offset);
-                color += texture2D(uTexture2D, vTexCoord + uStep * offset) * w;
-                weightSum += w;
+                float o = float(i) - 0.5;
+                float w = lanczos2(o);
+                color += texture2D(uTexture2D, vTexCoord + uStep * o) * w;
+                ws    += w;
             }
-            gl_FragColor = color / weightSum;
+            gl_FragColor = color / ws;
         }
     """
 
-    // --- Shader helpers ----------------------------------------------------------
+    // ── Pass C: Vertical Lanczos-2 (FBO-B → encoder surface) ─────────────────
+    private const val FRAGMENT_SHADER_LANCZOS_V = """
+        precision mediump float;
+        uniform sampler2D uTexture2D;
+        uniform mat4  uTexMatrix; // Unused but kept for program consistency if needed
+        uniform vec2 uStep;
+        varying vec2 vTexCoord;
+
+        float lanczos2(float x) {
+            if (x == 0.0) return 1.0;
+            if (abs(x) >= 2.0) return 0.0;
+            float px  = 3.14159265 * x;
+            float px2 = px * 0.5;
+            return (sin(px) / px) * (sin(px2) / px2);
+        }
+
+        void main() {
+            vec4  color = vec4(0.0); float ws = 0.0;
+            for (int i = -1; i <= 2; i++) {
+                float o = float(i) - 0.5;
+                float w = lanczos2(o);
+                color += texture2D(uTexture2D, vTexCoord + uStep * o) * w;
+                ws    += w;
+            }
+            gl_FragColor = color / ws;
+        }
+    """
+
+    // ── Shader helpers ────────────────────────────────────────────────────────
 
     private fun compileShader(type: Int, source: String): Int {
         val shader = GLES20.glCreateShader(type)
         GLES20.glShaderSource(shader, source)
         GLES20.glCompileShader(shader)
-        val compiled = IntArray(1)
-        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
-        if (compiled[0] == 0) {
-            Log.e(TAG, "Shader compile error: ${GLES20.glGetShaderInfoLog(shader)}")
-            GLES20.glDeleteShader(shader)
-            return 0
-        }
+        val ok = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, ok, 0)
+        if (ok[0] == 0) { Log.e(TAG, "Shader error: ${GLES20.glGetShaderInfoLog(shader)}"); GLES20.glDeleteShader(shader); return 0 }
         return shader
     }
 
-    private fun createProgram(vertSrc: String, fragSrc: String): Int {
-        val vertex   = compileShader(GLES20.GL_VERTEX_SHADER,   vertSrc)
-        val fragment = compileShader(GLES20.GL_FRAGMENT_SHADER, fragSrc)
-        val program  = GLES20.glCreateProgram()
-        GLES20.glAttachShader(program, vertex)
-        GLES20.glAttachShader(program, fragment)
-        GLES20.glLinkProgram(program)
-        val linked = IntArray(1)
-        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linked, 0)
-        if (linked[0] == 0) {
-            Log.e(TAG, "Program link error: ${GLES20.glGetProgramInfoLog(program)}")
-            GLES20.glDeleteProgram(program)
-            return 0
-        }
-        GLES20.glDeleteShader(vertex)
-        GLES20.glDeleteShader(fragment)
-        return program
+    private fun createProgram(v: String, f: String): Int {
+        val vert = compileShader(GLES20.GL_VERTEX_SHADER, v)
+        val frag = compileShader(GLES20.GL_FRAGMENT_SHADER, f)
+        val prog = GLES20.glCreateProgram()
+        GLES20.glAttachShader(prog, vert); GLES20.glAttachShader(prog, frag)
+        GLES20.glLinkProgram(prog)
+        val ok = IntArray(1)
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, ok, 0)
+        if (ok[0] == 0) { Log.e(TAG, "Link error: ${GLES20.glGetProgramInfoLog(prog)}"); GLES20.glDeleteProgram(prog); return 0 }
+        GLES20.glDeleteShader(vert); GLES20.glDeleteShader(frag)
+        return prog
     }
 
-    // --- Public API --------------------------------------------------------------
+    private fun makeFbo(w: Int, h: Int): Pair<Int, Int> {
+        val fbo = IntArray(1); val tex = IntArray(1)
+        GLES20.glGenFramebuffers(1, fbo, 0); GLES20.glGenTextures(1, tex, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, tex[0], 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        return fbo[0] to tex[0]
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
 
     fun computeParams(
         targetSizeMb: Float,
@@ -170,87 +218,72 @@ object VideoCompressor {
         srcWidth: Int,
         srcHeight: Int,
         frameRate: Float,
-        useH265: Boolean,
-        // Fraction of the target budget to actually use. Caller sets this after
-        // querying real encoder capabilities so headroom matches actual behaviour.
+        codecChoice: CodecChoice,
         headroom: Float = 0.88f
     ): Pair<Int, Int> {
-        val fps = frameRate.coerceIn(1f, 120f)
-
-        val audioBudgetBits = if (durationSecs > 0) (AUDIO_KBPS * 1000L * durationSecs) else 0L
-        // 1 MB = 8 × 1,048,576 bits. headroom is set by the caller based on
-        // whether the encoder supports true CBR or falls back to VBR.
+        val fps             = frameRate.coerceIn(1f, 120f)
+        val audioBudget     = if (durationSecs > 0) AUDIO_KBPS * 1000L * durationSecs else 0L
         val targetBits      = (targetSizeMb * 8_388_608f * headroom).toLong()
-        val videoBudgetBits = (targetBits - audioBudgetBits).coerceAtLeast(targetBits / 2)
-        val rawBitrateBps   = if (durationSecs > 0)
-            (videoBudgetBits / durationSecs).toInt()
-        else
-            (srcBitrateKbps * 1000 * 0.5f).roundToInt()
+        val videoBudget     = (targetBits - audioBudget).coerceAtLeast(targetBits / 2)
+        val rawBps          = if (durationSecs > 0) (videoBudget / durationSecs).toInt()
+        else (srcBitrateKbps * 1000 * 0.5f).roundToInt()
+        val videoTargetBps  = rawBps.coerceIn(ABS_FLOOR_BPS, ABS_CEILING_BPS)
 
-        // Do NOT apply a codec factor here. The budget math already produces the
-        // bitrate that fills the target file size exactly. The codec choice (H.264
-        // vs H.265) affects quality at that bitrate, not the number of bytes written.
-        // Applying 0.5× for H.265 was halving the bitrate a second time, causing
-        // the output to be ~55–60% of the requested target size.
-        val videoTargetBps = rawBitrateBps.coerceIn(ABS_FLOOR_BPS, ABS_CEILING_BPS)
+        // Codec-aware BPP: AV1 (0.09) < H.265 (0.13) < H.264 (0.20)
+        // High efficiency codecs can target higher resolutions at the same bitrate.
+        val targetBpp = when (codecChoice) {
+            CodecChoice.AV1  -> 0.09f
+            CodecChoice.H265 -> 0.13f
+            CodecChoice.H264 -> 0.20f
+        }
 
-        val aspectRatio   = srcWidth.toFloat() / srcHeight.toFloat()
-        val totalPixels   = videoTargetBps.toFloat() / (TARGET_BPP * fps)
-        val idealHeight   = sqrt(totalPixels / aspectRatio)
-        // Never downscale below 480p — blurry 480p beats sharp 160p at the
-        // same bitrate. The encoder uses fewer bits per frame when tight.
-        val minHeight    = minOf(480, srcHeight)
-        val rawHeight    = idealHeight.roundToInt().coerceIn(minHeight, srcHeight)
-        // Align height to 16 then clamp back to srcHeight so we never request
-        // a resolution larger than the source (e.g. source 2340x1080: aligned
-        // width 2352 exceeds source width 2340 and the encoder rejects it).
-        val outputHeight = alignTo16(rawHeight).coerceIn(16, srcHeight)
+        val ar          = srcWidth.toFloat() / srcHeight
+        val totalPixels = videoTargetBps.toFloat() / (targetBpp * fps)
+        val idealH      = sqrt(totalPixels / ar)
+        val minH        = minOf(480, srcHeight)
+        val rawH        = idealH.roundToInt().coerceIn(minH, srcHeight)
+        val outH        = alignTo16(rawH).coerceIn(16, srcHeight)
 
-        Log.d(TAG, "computeParams -> bitrate=${videoTargetBps / 1000}kbps height=$outputHeight")
-        return Pair(videoTargetBps, outputHeight)
+        Log.d(TAG, "computeParams -> codec=${codecChoice.label} bitrate=${videoTargetBps/1000}kbps height=$outH BPP=$targetBpp")
+        return videoTargetBps to outH
     }
 
     fun compress(
         context: Context,
         inputUri: Uri,
         outputPath: String,
-        useH265: Boolean,
+        codecChoice: CodecChoice,
         targetSizeMb: Float,
+        editState: EditState = EditState(),
         onProgress: (Float) -> Unit,
         onSuccess: () -> Unit,
         onCancelled: () -> Unit,
         onFailure: (Exception) -> Unit
     ): CompressionJob {
-        val cancelFlag  = AtomicBoolean(false)
-        val workThread  = HandlerThread("CompressThread").apply { start() }
-        val handler     = Handler(workThread.looper)
-
+        val cancelFlag = AtomicBoolean(false)
+        val thread     = HandlerThread("CompressThread").apply { start() }
+        val handler    = Handler(thread.looper)
         handler.post {
             try {
-                runCompression(
-                    context, inputUri, outputPath, useH265,
-                    targetSizeMb, cancelFlag, onProgress, onSuccess, onCancelled, onFailure
-                )
+                runCompression(context, inputUri, outputPath, codecChoice,
+                    targetSizeMb, editState, cancelFlag, onProgress, onSuccess, onCancelled, onFailure)
             } catch (e: Exception) {
-                if (!cancelFlag.get()) {
-                    Log.e(TAG, "Compression error", e)
-                    Handler(context.mainLooper).post { onFailure(e) }
-                }
-                workThread.quitSafely()
+                if (!cancelFlag.get()) { Log.e(TAG, "Compression error", e); Handler(context.mainLooper).post { onFailure(e) } }
+                thread.quitSafely()
             }
         }
-
-        return CompressionJob(cancelFlag, workThread, handler)
+        return CompressionJob(cancelFlag, thread, handler)
     }
 
-    // --- Core pipeline -----------------------------------------------------------
+    // ── Core pipeline ─────────────────────────────────────────────────────────
 
     private fun runCompression(
         context: Context,
         inputUri: Uri,
         outputPath: String,
-        useH265: Boolean,
+        codecChoice: CodecChoice,
         targetSizeMb: Float,
+        editState: EditState,
         cancelFlag: AtomicBoolean,
         onProgress: (Float) -> Unit,
         onSuccess: () -> Unit,
@@ -258,650 +291,417 @@ object VideoCompressor {
         onFailure: (Exception) -> Unit
     ) {
         val info = getVideoInfo(context, inputUri)
-        // info.width/height are display-space (rotation-corrected) since getVideoInfo
-        // now applies the rotation swap. computeParams gets the correct aspect ratio.
-        val (targetBitrate, targetHeight) = computeParams(
-            targetSizeMb, info.durationSecs, info.bitrateKbps,
-            info.width, info.height, info.frameRate, useH265
-        )
 
-        // ---- Track discovery ----------------------------------------------------
+        // Effective duration for bitrate budget: trim if set
+        val trimStartUs = editState.trimStartMs * 1000L
+        val trimEndUs   = editState.trimEndMs?.let { it * 1000L }
+        val effectiveDurSecs = if (trimEndUs != null)
+            ((trimEndUs - trimStartUs) / 1_000_000L).coerceAtLeast(1L)
+        else
+            info.durationSecs
+
+        // ── Track discovery ───────────────────────────────────────────────────
         val extractor = MediaExtractor().apply { setDataSource(context, inputUri, null) }
-
-        var videoTrackIndex = -1
-        var audioTrackIndex = -1
-        var videoFormat: MediaFormat? = null
-        var audioFormat: MediaFormat? = null
+        var videoIdx = -1; var audioIdx = -1
+        var videoFmt: MediaFormat? = null; var audioFmt: MediaFormat? = null
         var rotation = 0
-
         for (i in 0 until extractor.trackCount) {
-            val format = extractor.getTrackFormat(i)
-            val mime   = format.getString(MediaFormat.KEY_MIME)
+            val fmt  = extractor.getTrackFormat(i)
+            val mime = fmt.getString(MediaFormat.KEY_MIME)
             when {
-                mime?.startsWith("video/") == true && videoTrackIndex == -1 -> {
-                    videoTrackIndex = i
-                    videoFormat     = format
-                    rotation        = format.getInteger(MediaFormat.KEY_ROTATION, 0)
+                mime?.startsWith("video/") == true && videoIdx == -1 -> {
+                    videoIdx = i; videoFmt = fmt
+                    rotation = try {
+                        if (Build.VERSION.SDK_INT >= 29) {
+                            fmt.getInteger(MediaFormat.KEY_ROTATION, 0)
+                        } else {
+                            if (fmt.containsKey(MediaFormat.KEY_ROTATION)) fmt.getInteger(MediaFormat.KEY_ROTATION) else 0
+                        }
+                    } catch (_: Exception) { 0 }
                 }
-                mime?.startsWith("audio/") == true && audioTrackIndex == -1 -> {
-                    audioTrackIndex = i
-                    audioFormat     = format
-                }
+                mime?.startsWith("audio/") == true && audioIdx == -1 -> { audioIdx = i; audioFmt = fmt }
             }
         }
+        if (videoIdx == -1) { extractor.release(); throw IllegalStateException("No video track found") }
 
-        if (videoTrackIndex == -1) {
-            extractor.release()
-            throw IllegalStateException("No video track found")
-        }
+        // ── Dimensions ───────────────────────────────────────────────────────
+        val codedW = videoFmt!!.getInteger(MediaFormat.KEY_WIDTH)
+        val codedH = videoFmt!!.getInteger(MediaFormat.KEY_HEIGHT)
+        val swapped = rotation == 90 || rotation == 270
+        val srcW = if (swapped) codedH else codedW
+        val srcH = if (swapped) codedW  else codedH
 
-        // ---- Output dimensions --------------------------------------------------
-        val codedWidth  = videoFormat!!.getInteger(MediaFormat.KEY_WIDTH)
-        val codedHeight = videoFormat!!.getInteger(MediaFormat.KEY_HEIGHT)
+        // Crop dimensions affect the output resolution calculation
+        val crop        = editState.cropRect ?: CropRect.FULL
+        val cropPxW     = (srcW * crop.width).roundToInt().coerceAtLeast(1)
+        val cropPxH     = (srcH * crop.height).roundToInt().coerceAtLeast(1)
 
-        // MediaFormat KEY_WIDTH/KEY_HEIGHT are always *coded* (bitstream) dimensions
-        // and do not account for rotation. We must swap them into display space here
-        // for the encoder resolution and aspect ratio math.
-        // Note: getVideoInfo already returns display-space dims in info.width/height,
-        // so computeParams always gets the correct aspect ratio. This local swap is
-        // still needed for encFinalWidth/encFinalHeight passed to the encoder.
-        val displaySwapped = rotation == 90 || rotation == 270
-        val srcWidth  = if (displaySwapped) codedHeight else codedWidth
-        val srcHeight = if (displaySwapped) codedWidth  else codedHeight
-
-        val targetWidth = (targetHeight.toFloat() * srcWidth / srcHeight).roundToInt()
-        // Align then clamp to srcWidth/srcHeight so non-16-aligned source widths
-        // (e.g. 2340) don't produce aligned values that exceed the source dimensions.
-        val finalWidth  = alignTo16(targetWidth).coerceAtMost(srcWidth)
-        val finalHeight = targetHeight.coerceAtMost(srcHeight)
-        val encoderMime       = if (useH265) MediaFormat.MIMETYPE_VIDEO_HEVC
-        else         MediaFormat.MIMETYPE_VIDEO_AVC
-        val frameRateInt      = info.frameRate.toInt().coerceIn(1, 120)
-
-        // ---- Encoder capability resolution ─────────────────────────────────────
-        // findEncoderForFormat(mime + dimensions) returns null on many devices when
-        // the requested dimensions exceed the encoder's *advertised* max, even though
-        // the encoder works fine at those dimensions in practice (OMX.MTK.VIDEO.ENCODER.HEVC
-        // won't advertise 2340x1080 but encodes it without issue).
-        // Strategy: find by mime type only, then use capability info to clamp
-        // dimensions and bitrate — never reject based on declared caps alone.
-        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-
-        // Find encoder by mime type only (no dimension filter)
-        val encoderInfo = codecList.codecInfos
-            .firstOrNull { it.isEncoder && it.supportedTypes.contains(encoderMime) }
-
-        if (encoderInfo == null) {
-            // Codec genuinely absent from device
-            if (useH265) {
-                Log.w(TAG, "No H.265 encoder on device, falling back to H.264")
-                return runCompression(
-                    context, inputUri, outputPath, false, targetSizeMb,
-                    cancelFlag, onProgress, onSuccess, onCancelled, onFailure
-                )
-            } else {
-                throw IllegalStateException("No H.264 encoder found on device")
-            }
-        }
-
-        val encoderCaps   = encoderInfo.getCapabilitiesForType(encoderMime)
-        val videoCaps     = encoderCaps.videoCapabilities
-
-        // Clamp requested dimensions to what the encoder actually declares.
-        // If the encoder under-reports (common on MTK), we pass the original
-        // dimensions and let the hardware decide — it almost always works.
-        val encMaxW = videoCaps.supportedWidths.upper
-        val encMaxH = videoCaps.supportedHeights.upper
-        val encFinalWidth  = if (finalWidth  > encMaxW) {
-            Log.w(TAG, "Width $finalWidth exceeds declared max $encMaxW — attempting anyway")
-            finalWidth   // attempt at requested size; hardware usually accepts it
-        } else finalWidth
-        val encFinalHeight = if (finalHeight > encMaxH) {
-            Log.w(TAG, "Height $finalHeight exceeds declared max $encMaxH — attempting anyway")
-            finalHeight
-        } else finalHeight
-
-        // CBR support and headroom — calibrated from real OMX.MTK device measurements:
-        //   CBR H.265: overshoots ~4–8%  → headroom 0.92
-        //   VBR H.264: overshoots ~3–5%  → headroom 0.93
-        val cbrSupported = encoderCaps.encoderCapabilities.isBitrateModeSupported(
-            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-        val headroom = if (cbrSupported) 0.92f else 0.93f
-
-        val (rawAdjustedBitrate, _) = computeParams(
-            targetSizeMb, info.durationSecs, info.bitrateKbps,
-            srcWidth, srcHeight, info.frameRate, useH265, headroom
+        val (_, targetHeight) = computeParams(
+            targetSizeMb, effectiveDurSecs, info.bitrateKbps,
+            cropPxW, cropPxH,
+            info.frameRate, codecChoice
         )
-        // Clamp to declared ceiling — never reject or fall back on bitrate alone.
-        val encoderBitrateCeiling = videoCaps.bitrateRange.upper
-        val adjustedBitrate = rawAdjustedBitrate.coerceAtMost(encoderBitrateCeiling)
-        Log.d(TAG, "Bitrate: raw=${rawAdjustedBitrate/1000}kbps  ceiling=${encoderBitrateCeiling/1000}kbps  final=${adjustedBitrate/1000}kbps")
 
-        // ---- Encoder ------------------------------------------------------------
-        val encoder = MediaCodec.createEncoderByType(encoderMime)
-        val encoderFormat = MediaFormat.createVideoFormat(encoderMime, encFinalWidth, encFinalHeight).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE,    adjustedBitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE,  frameRateInt)
-            // Only set CBR mode when the encoder actually supports it. Setting an
-            // unsupported bitrate mode causes some encoders to behave erratically.
-            if (cbrSupported) {
-                setInteger(MediaFormat.KEY_BITRATE_MODE,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-            }
-            // 4-second keyframe interval. 1s was forcing ~600 large keyframes
-            // for a 10-min video, each 5–20× bigger than a P-frame, bloating
-            // the output. 4s keeps seeking reasonable while cutting overhead.
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 4)
-            setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            // Non-realtime priority: tells the encoder this is an offline
-            // transcode, not live capture. Enables slower, higher-quality
-            // encoding paths on hardware encoders that support two modes.
-            // Silently ignored by encoders that don't distinguish modes.
-            try { setInteger(MediaFormat.KEY_PRIORITY, 1) }
-            catch (_: Exception) {}
-            // B-frames: enabled for H.265 only.
-            // H.264 on MTK hardware (OMX.MTK.VIDEO.ENCODER.AVC) accepts
-            // KEY_MAX_B_FRAMES = 2 without error but doesn't correctly signal
-            // B-frame reordering in the output bitstream — the muxer writes
-            // frames in encode order but the decoder renders them out of display
-            // order, producing glitchy / corrupted playback.
-            // H.265 (OMX.MTK.VIDEO.ENCODER.HEVC) handles B-frames correctly.
-            if (encoderMime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            } else {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            }
-            // Encoder complexity hint (0–10). Higher = more CPU time on motion
-            // estimation = better quality per bit. Silently ignored if unsupported.
-            try { setInteger(MediaFormat.KEY_COMPLEXITY, 10) }
-            catch (_: Exception) {}
-            // Profile hints — use Main for both codecs on MTK hardware.
-            // AVCProfileHigh causes silent failures on OMX.MTK.VIDEO.ENCODER.AVC;
-            // AVCProfileMain still enables CABAC and is reliably supported.
-            // HEVCProfileMain is the correct baseline for H.265.
-            if (encoderMime == MediaFormat.MIMETYPE_VIDEO_AVC) {
-                try {
-                    setInteger(MediaFormat.KEY_PROFILE,
-                        MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
-                    setInteger(MediaFormat.KEY_LEVEL,
-                        MediaCodecInfo.CodecProfileLevel.AVCLevel41)
-                } catch (_: Exception) {}
-            } else if (encoderMime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
-                try {
-                    setInteger(MediaFormat.KEY_PROFILE,
-                        MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
-                    setInteger(MediaFormat.KEY_LEVEL,
-                        MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41)
-                } catch (_: Exception) {}
-            }
+        val targetW   = (targetHeight.toFloat() * cropPxW / cropPxH).roundToInt()
+        val finalW    = alignTo16(targetW).coerceAtMost(cropPxW)
+        val finalH    = targetHeight.coerceAtMost(cropPxH)
+        val encMime   = codecChoice.mime
+        val fpsInt    = info.frameRate.toInt().coerceIn(1, 120)
+
+        // Box taps based on crop region size, not full frame size
+        val tapX = ceil(cropPxW.toFloat() / finalW).toInt().coerceIn(1, 8)
+        val tapY = ceil(cropPxH.toFloat() / finalH).toInt().coerceIn(1, 8)
+        Log.d(TAG, "Box taps: ${tapX}x${tapY}  crop: ${cropPxW}x${cropPxH} -> ${finalW}x${finalH}")
+
+        // ── Encoder ───────────────────────────────────────────────────────────
+        val codecList   = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val encInfo     = codecList.codecInfos.firstOrNull { it.isEncoder && it.supportedTypes.contains(encMime) }
+        if (encInfo == null) {
+            val fallback = when (codecChoice) { CodecChoice.AV1 -> CodecChoice.H265; CodecChoice.H265 -> CodecChoice.H264; CodecChoice.H264 -> null }
+            if (fallback != null) {
+                Log.w(TAG, "No encoder for ${codecChoice.label}, falling back to ${fallback.label}")
+                return runCompression(context, inputUri, outputPath, fallback, targetSizeMb, editState, cancelFlag, onProgress, onSuccess, onCancelled, onFailure)
+            } else throw IllegalStateException("No H.264 encoder found on device")
         }
-        encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val encoderInputSurface = encoder.createInputSurface()
+
+        val encCaps  = encInfo.getCapabilitiesForType(encMime)
+        val vidCaps  = encCaps.videoCapabilities ?: throw IllegalStateException("No video capabilities for $encMime")
+        val encMaxW  = vidCaps.supportedWidths.upper
+        val encMaxH  = vidCaps.supportedHeights.upper
+        val encFW    = if (finalW > encMaxW) { Log.w(TAG, "Width $finalW > $encMaxW — attempting"); finalW } else finalW
+        val encFH    = if (finalH > encMaxH) { Log.w(TAG, "Height $finalH > $encMaxH — attempting"); finalH } else finalH
+
+        val encoderCaps = encCaps.encoderCapabilities
+        val vbrOk    = encoderCaps?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) == true
+        val headroom = if (vbrOk) 0.90f else 0.92f
+        val (rawBr, _) = computeParams(targetSizeMb, effectiveDurSecs, info.bitrateKbps, cropPxW, cropPxH, info.frameRate, codecChoice, headroom)
+        val bitrate  = rawBr.coerceAtMost(vidCaps.bitrateRange.upper)
+
+        val encoder  = MediaCodec.createEncoderByType(encMime)
+        val encFmt   = MediaFormat.createVideoFormat(encMime, encFW, encFH).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE,   bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fpsInt)
+            if (vbrOk) setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            else setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3) // More efficient for offline storage
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            try { setInteger(MediaFormat.KEY_PRIORITY, 1) } catch (_: Exception) {}
+            when (codecChoice) {
+                CodecChoice.H264 -> { setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0); try { setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain); setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41) } catch (_: Exception) {} }
+                CodecChoice.H265 -> { setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0); try { setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain); setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41) } catch (_: Exception) {} }
+                CodecChoice.AV1  -> { try { setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AV1ProfileMain8) } catch (_: Exception) {} }
+            }
+            try { setInteger(MediaFormat.KEY_COMPLEXITY, 10) } catch (_: Exception) {}
+        }
+        encoder.configure(encFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val encSurface = encoder.createInputSurface()
         encoder.start()
 
-        // ---- Diagnostic logging — visible in Logcat filtered by "VideoCompressor" ----
         Log.i(TAG, "=== Compression params ===")
-        Log.i(TAG, "  Codec        : $encoderMime  (${encoder.name})")
-        Log.i(TAG, "  Resolution   : ${encFinalWidth}x${encFinalHeight}  (source: ${srcWidth}x${srcHeight})")
-        Log.i(TAG, "  Bitrate      : ${adjustedBitrate / 1000} kbps  (headroom=${headroom})")
-        Log.i(TAG, "  Frame rate   : $frameRateInt fps  |  Duration: ${info.durationSecs}s")
-        Log.i(TAG, "  Target size  : $targetSizeMb MB")
-        Log.i(TAG, "  CBR support  : $cbrSupported  |  Mode applied: ${if (cbrSupported) "CBR" else "VBR (fallback — size accuracy is best-effort)"}")
+        Log.i(TAG, "  Codec      : $encMime  (${encoder.name})")
+        Log.i(TAG, "  Resolution : ${encFW}x${encFH}  (crop src: ${cropPxW}x${cropPxH})")
+        Log.i(TAG, "  Bitrate    : ${bitrate/1000} kbps  headroom=$headroom")
+        Log.i(TAG, "  Duration   : ${effectiveDurSecs}s  (trim: ${editState.trimStartMs}ms – ${editState.trimEndMs ?: "end"}ms)")
+        Log.i(TAG, "  Crop       : left=${crop.left} top=${crop.top} right=${crop.right} bottom=${crop.bottom}")
+        Log.i(TAG, "  VBR        : $vbrOk")
         Log.i(TAG, "==========================")
 
-        // ---- EGL — all GL work runs on CompressThread (this thread) -------------
-        // FIX (Bug 1): eglMakeCurrent AND all subsequent GL calls stay on the same
-        // thread. We no longer spawn a separate RenderThread for GL work.
-        val eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        val version    = IntArray(2)
-        EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
+        // ── EGL ───────────────────────────────────────────────────────────────
+        val eglDisp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        EGL14.eglInitialize(eglDisp, IntArray(2), 0, IntArray(2), 1)
+        val cfgAttr = intArrayOf(EGL14.EGL_RED_SIZE,8, EGL14.EGL_GREEN_SIZE,8, EGL14.EGL_BLUE_SIZE,8, EGL14.EGL_ALPHA_SIZE,8, EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, EGL14.EGL_NONE)
+        val cfgs = arrayOfNulls<EGLConfig>(1); val nCfg = IntArray(1)
+        EGL14.eglChooseConfig(eglDisp, cfgAttr, 0, cfgs, 0, 1, nCfg, 0)
+        val eglCtx  = EGL14.eglCreateContext(eglDisp, cfgs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+        val eglSurf = EGL14.eglCreateWindowSurface(eglDisp, cfgs[0], encSurface, intArrayOf(EGL14.EGL_NONE), 0)
+        EGL14.eglMakeCurrent(eglDisp, eglSurf, eglSurf, eglCtx)
 
-        val attribList = intArrayOf(
-            EGL14.EGL_RED_SIZE,        8,
-            EGL14.EGL_GREEN_SIZE,      8,
-            EGL14.EGL_BLUE_SIZE,       8,
-            EGL14.EGL_ALPHA_SIZE,      8,
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-            EGL14.EGL_NONE
-        )
-        val configs    = arrayOfNulls<EGLConfig>(1)
-        val numConfigs = IntArray(1)
-        EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, 1, numConfigs, 0)
+        // ── GL programs ───────────────────────────────────────────────────────
+        val progBox  = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_BOX)
+        val progLanH = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_LANCZOS_H)
+        val progLanV = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_LANCZOS_V)
 
-        val eglContext = EGL14.eglCreateContext(
-            eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT,
-            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
-        )
-        val eglSurface = EGL14.eglCreateWindowSurface(
-            eglDisplay, configs[0], encoderInputSurface,
-            intArrayOf(EGL14.EGL_NONE), 0
-        )
-        // Make current on THIS thread — all GL calls below must stay here.
-        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        val verts = floatArrayOf(-1f,-1f,0f,0f, 1f,-1f,1f,0f, -1f,1f,0f,1f, 1f,1f,1f,1f)
+        val vBuf  = ByteBuffer.allocateDirect(verts.size*4).order(ByteOrder.nativeOrder()).asFloatBuffer().also { it.put(verts).position(0) }
 
-        // ---- OpenGL programs + geometry -----------------------------------------
-        // Pass 1: OES external texture → intermediate FBO (horizontal Lanczos)
-        val progPass1    = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_PASS1)
-        // Pass 2: intermediate FBO → encoder surface (vertical Lanczos)
-        val progPass2    = createProgram(VERTEX_SHADER, FRAGMENT_SHADER_PASS2)
+        val aPos1=GLES20.glGetAttribLocation(progBox,"aPosition");  val aTex1=GLES20.glGetAttribLocation(progBox,"aTexCoord")
+        val aPos2=GLES20.glGetAttribLocation(progLanH,"aPosition"); val aTex2=GLES20.glGetAttribLocation(progLanH,"aTexCoord")
+        val aPos3=GLES20.glGetAttribLocation(progLanV,"aPosition"); val aTex3=GLES20.glGetAttribLocation(progLanV,"aTexCoord")
 
-        // Geometry: full-screen quad. V is NOT flipped here — the SurfaceTexture
-        // transform matrix (uTexMatrix) handles the Y-axis correctly per-frame.
-        val vertices = floatArrayOf(
-            -1f, -1f,  0f, 0f,
-            1f, -1f,  1f, 0f,
-            -1f,  1f,  0f, 1f,
-            1f,  1f,  1f, 1f
-        )
-        val vertBuffer = ByteBuffer
-            .allocateDirect(vertices.size * 4)
-            .order(ByteOrder.nativeOrder())
-            .asFloatBuffer()
-            .also { it.put(vertices).position(0) }
+        GLES20.glClearColor(0f,0f,0f,1f)
 
-        // Wire geometry into both programs
-        for (prog in intArrayOf(progPass1, progPass2)) {
-            GLES20.glUseProgram(prog)
-            val pLoc = GLES20.glGetAttribLocation(prog, "aPosition")
-            val tLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
-            vertBuffer.position(0)
-            GLES20.glVertexAttribPointer(pLoc, 2, GLES20.GL_FLOAT, false, 4 * 4, vertBuffer)
-            GLES20.glEnableVertexAttribArray(pLoc)
-            vertBuffer.position(2)
-            GLES20.glVertexAttribPointer(tLoc, 2, GLES20.GL_FLOAT, false, 4 * 4, vertBuffer)
-            GLES20.glEnableVertexAttribArray(tLoc)
-        }
-        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        val oesId = IntArray(1)
+        GLES20.glGenTextures(1, oesId, 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesId[0])
+        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
+        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR.toFloat())
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-        // OES texture — decoder writes frames here via SurfaceTexture
-        val textureId = IntArray(1)
-        GLES20.glGenTextures(1, textureId, 0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId[0])
-        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-            GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
-        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-            GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR.toFloat())
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-            GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-            GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        // FBO-A: box output at CROP size; FBO-B: lanczos-H output at ENCODE size
+        val (fboAId, fboATex) = makeFbo(cropPxW, cropPxH)
+        val (fboBId, fboBTex) = makeFbo(encFW, encFH)
 
-        // Intermediate FBO + RGBA texture for the horizontal pass output.
-        // Size = output resolution so pass 2 reads at 1:1.
-        val fboId   = IntArray(1)
-        val fboTexId = IntArray(1)
-        GLES20.glGenFramebuffers(1, fboId, 0)
-        GLES20.glGenTextures(1, fboTexId, 0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId[0])
-        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
-            encFinalWidth, encFinalHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
-            GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
-            GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
-            GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D,
-            GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId[0])
-        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
-            GLES20.GL_TEXTURE_2D, fboTexId[0], 0)
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        // Uniform locations
+        val uTMBox=GLES20.glGetUniformLocation(progBox,"uTexMatrix"); val uStepBox=GLES20.glGetUniformLocation(progBox,"uStepSrc")
+        val uTapXB=GLES20.glGetUniformLocation(progBox,"uTapX");      val uTapYB=GLES20.glGetUniformLocation(progBox,"uTapY")
+        val uSmpBox=GLES20.glGetUniformLocation(progBox,"uTexture");   val uCropOri=GLES20.glGetUniformLocation(progBox,"uCropOrigin")
+        val uCropSz=GLES20.glGetUniformLocation(progBox,"uCropSize")
+        val uTMLH=GLES20.glGetUniformLocation(progLanH,"uTexMatrix"); val uStepLH=GLES20.glGetUniformLocation(progLanH,"uStep"); val uSmpLH=GLES20.glGetUniformLocation(progLanH,"uTexture2D")
+        val uTMLV=GLES20.glGetUniformLocation(progLanV,"uTexMatrix"); val uStepLV=GLES20.glGetUniformLocation(progLanV,"uStep"); val uSmpLV=GLES20.glGetUniformLocation(progLanV,"uTexture2D")
 
-        // Transform matrix storage — updated each frame from SurfaceTexture
-        val texMatrix = FloatArray(16)
+        val identity = floatArrayOf(1f,0f,0f,0f, 0f,1f,0f,0f, 0f,0f,1f,0f, 0f,0f,0f,1f)
 
-        // Cache all uniform locations once here — calling glGetUniformLocation
-        // inside the per-frame render loop causes a driver roundtrip every frame.
-        // For a 756-frame video that's ~6000 redundant GL calls eliminated.
-        val uTexMatrixLoc1 = GLES20.glGetUniformLocation(progPass1, "uTexMatrix")
-        val uStepLoc1      = GLES20.glGetUniformLocation(progPass1, "uStep")
-        val uSamplerLoc1   = GLES20.glGetUniformLocation(progPass1, "uTexture")
-        val uTexMatrixLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexMatrix")
-        val uStepLoc2      = GLES20.glGetUniformLocation(progPass2, "uStep")
-        val uSamplerLoc2   = GLES20.glGetUniformLocation(progPass2, "uTexture")
-        // Identity matrix for pass 2 (regular 2D texture — no OES transform needed)
-        val identityMatrix = floatArrayOf(1f,0f,0f,0f, 0f,1f,0f,0f, 0f,0f,1f,0f, 0f,0f,0f,1f)
-        // Precompute step values — these only change if resolution changes (it doesn't)
-        val stepH = 1f / srcWidth    // horizontal step for pass 1
-        val stepV = 1f / srcHeight   // vertical step for pass 2
+        // Lanczos steps in crop-region UV space
+        val stepCropX = 1f / cropPxW
+        val stepCropY = 1f / cropPxH
 
-        // FIX (Bug 5): keep references so we can release them in the cleanup block.
-        val surfaceTexture       = SurfaceTexture(textureId[0])
-        val decoderOutputSurface = Surface(surfaceTexture)
+        val surfTex  = SurfaceTexture(oesId[0])
+        val decSurf  = Surface(surfTex)
 
-        // FIX (Bug 2): use a CountDownLatch instead of an AtomicBoolean + polling.
-        // Each time a frame arrives the latch is counted down to 1 on a dedicated
-        // callback thread, and the main loop awaits it with a timeout.
-        var frameLatch = CountDownLatch(1)
-        val frameCallbackThread = HandlerThread("FrameCallback").apply { start() }
-        surfaceTexture.setOnFrameAvailableListener(
-            { frameLatch.countDown() },
-            Handler(frameCallbackThread.looper)
-        )
-        // Latch timeout = 3× the frame interval, min 50ms, max 200ms.
-        // 100ms flat was fine at 30fps but at 63fps frames arrive every 16ms —
-        // a timed-out latch stalls the pipeline for 100ms per frame (6+ seconds
-        // of unnecessary waiting for a 756-frame video).
-        val frameLatchTimeoutMs = (3000L / frameRateInt.toLong()).coerceIn(50L, 200L)
+        var latch = CountDownLatch(1)
+        val cbThread = HandlerThread("FrameCallback").apply { start() }
+        surfTex.setOnFrameAvailableListener({ latch.countDown() }, Handler(cbThread.looper))
+        val latchTimeout = (3000L / fpsInt.toLong()).coerceIn(50L, 200L)
 
-        // ---- Decoder ------------------------------------------------------------
-        val decoderMime = videoFormat!!.getString(MediaFormat.KEY_MIME)!!
-        val decoder     = MediaCodec.createDecoderByType(decoderMime)
-        decoder.configure(videoFormat, decoderOutputSurface, null, 0)
+        // ── Decoder ───────────────────────────────────────────────────────────
+        val decMime = videoFmt!!.getString(MediaFormat.KEY_MIME)!!
+        val decoder = MediaCodec.createDecoderByType(decMime)
+        decoder.configure(videoFmt, decSurf, null, 0)
         decoder.start()
 
-        // ---- Muxer (tracks added, then started after first encoded frame) -------
-        val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-
-        // FIX (Bug 8): record rotation now so we can apply it before muxer.start()
-        // regardless of which track is added first.
-        if (rotation != 0) muxer.setOrientationHint(rotation)
-
-        var videoTrackMuxerIndex = -1
-        var audioTrackMuxerIndex = -1
-        var muxerStarted         = false
-
-        if (audioTrackIndex != -1 && audioFormat != null) {
-            audioTrackMuxerIndex = muxer.addTrack(audioFormat!!)
+        // ── Seek to trim start ─────────────────────────────────────────────────
+        if (editState.trimStartMs > 0L) {
+            extractor.selectTrack(videoIdx)
+            extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        } else {
+            extractor.selectTrack(videoIdx)
         }
 
-        // ---- Audio extractor ----------------------------------------------------
-        var audioExtractor: MediaExtractor? = null
-        if (audioTrackIndex != -1) {
-            audioExtractor = MediaExtractor().apply {
+        // ── Muxer ─────────────────────────────────────────────────────────────
+        val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        // Set rotation to 0 because we've already applied it in the shader via uTexMatrix.
+        muxer.setOrientationHint(0)
+
+        var vidMuxIdx = -1; var audMuxIdx = -1; var muxStarted = false
+        if (audioIdx != -1 && audioFmt != null) audMuxIdx = muxer.addTrack(audioFmt!!)
+
+        // ── Audio extractor ───────────────────────────────────────────────────
+        var audioExt: MediaExtractor? = null
+        if (audioIdx != -1) {
+            audioExt = MediaExtractor().apply {
                 setDataSource(context, inputUri, null)
-                selectTrack(audioTrackIndex)
+                selectTrack(audioIdx)
+                if (editState.trimStartMs > 0L) seekTo(trimStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             }
         }
 
-        // Pending audio samples buffered until the muxer is started by the first
-        // encoded video frame (FIX Bug 6: no audio is silently dropped).
         data class AudioSample(val data: ByteArray, val pts: Long, val flags: Int)
         val pendingAudio = ArrayDeque<AudioSample>()
+        val audioBuf  = ByteBuffer.allocate(1_048_576)
+        var audioEos  = (audioIdx == -1)
+        var lastAudPts = 0L
 
-        // FIX (Bug D): 1 MB covers the largest AAC super-frames seen in the wild.
-        val audioBuffer  = ByteBuffer.allocate(1_048_576)
-        // FIX (Bug 7): initialise audioEos to true when there is no audio track so
-        // the main while-loop condition is satisfied without an audio extractor.
-        var audioEos     = (audioTrackIndex == -1)
-        var lastAudioPts = 0L
+        // PTS offset: subtract trim start so output starts at 0
+        val ptsOffsetUs = trimStartUs
 
-        val totalDurationUs  = info.durationSecs * 1_000_000L
-        var lastProgress     = 0f
-        var lastEncodedPts   = 0L   // tracks the most recent real encoder PTS
-        val progressHandler  = Handler(context.mainLooper)
+        val totalDurUs  = effectiveDurSecs * 1_000_000L
+        var lastProg    = 0f
+        var lastEncPts  = 0L
+        val progHandler = Handler(context.mainLooper)
 
-        extractor.selectTrack(videoTrackIndex)
-        var decoderEos   = false
-        var encoderEos   = false
-        var sawInputEos  = false
+        var decEos  = false; var encEos = false; var sawEos = false
 
-        // =========================================================================
-        // Main encode loop — everything runs on CompressThread
-        // =========================================================================
-        while (!cancelFlag.get() && (!decoderEos || !encoderEos || !audioEos)) {
+        // ═════════════════════════════════════════════════════════════════════
+        // Main loop
+        // ═════════════════════════════════════════════════════════════════════
+        while (!cancelFlag.get() && (!decEos || !encEos || !audioEos)) {
 
-            // ---- Feed decoder ---------------------------------------------------
-            if (!decoderEos) {
-                val inputIndex = decoder.dequeueInputBuffer(10_000)
-                if (inputIndex >= 0) {
-                    val inputBuffer = decoder.getInputBuffer(inputIndex)!!
-                    val sampleSize  = extractor.readSampleData(inputBuffer, 0)
-                    if (sampleSize < 0) {
-                        decoder.queueInputBuffer(
-                            inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                        )
-                        decoderEos = true
-                        Log.d(TAG, "Decoder EOS queued")
+            // Feed decoder
+            if (!decEos) {
+                val idx = decoder.dequeueInputBuffer(10_000)
+                if (idx >= 0) {
+                    val buf  = decoder.getInputBuffer(idx)!!
+                    val size = extractor.readSampleData(buf, 0)
+                    val samplePts = extractor.sampleTime
+                    // Stop feeding if we've passed the trim end
+                    val pastTrimEnd = trimEndUs != null && samplePts > trimEndUs
+                    if (size < 0 || pastTrimEnd) {
+                        decoder.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        decEos = true; Log.d(TAG, "Decoder EOS queued")
                     } else {
-                        decoder.queueInputBuffer(
-                            inputIndex, 0, sampleSize, extractor.sampleTime, 0
-                        )
+                        decoder.queueInputBuffer(idx, 0, size, samplePts, 0)
                         extractor.advance()
                     }
                 }
             }
 
-            // ---- Drain decoder — render frames to SurfaceTexture ----------------
-            val decoderOutInfo = MediaCodec.BufferInfo()
-            var decoderOutIdx  = decoder.dequeueOutputBuffer(decoderOutInfo, 10_000)
-            while (decoderOutIdx >= 0 && !cancelFlag.get()) {
-                val render = decoderOutInfo.size > 0
-                decoder.releaseOutputBuffer(decoderOutIdx, render)
-
+            // Drain decoder
+            val dInfo = MediaCodec.BufferInfo()
+            var dIdx  = decoder.dequeueOutputBuffer(dInfo, 10_000)
+            while (dIdx >= 0 && !cancelFlag.get()) {
+                val render = dInfo.size > 0
+                decoder.releaseOutputBuffer(dIdx, render)
                 if (render) {
-                    val arrived = frameLatch.await(frameLatchTimeoutMs, TimeUnit.MILLISECONDS)
-                    if (!arrived) Log.w(TAG, "Frame latch timed out — skipping render")
-                    frameLatch = CountDownLatch(1)
+                    val arrived = latch.await(latchTimeout, TimeUnit.MILLISECONDS)
+                    if (!arrived) Log.w(TAG, "Frame latch timeout")
+                    latch = CountDownLatch(1)
 
-                    surfaceTexture.updateTexImage()
-                    surfaceTexture.getTransformMatrix(texMatrix)
+                    surfTex.updateTexImage()
+                    val texMtx = FloatArray(16); surfTex.getTransformMatrix(texMtx)
 
-                    // ── Pass 1: OES texture → FBO (horizontal Lanczos) ───────────
-                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId[0])
-                    GLES20.glViewport(0, 0, encFinalWidth, encFinalHeight)
+                    // ── Pass A: Box (OES → FBO-A, crop region) ────────────────
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboAId)
+                    GLES20.glViewport(0, 0, cropPxW, cropPxH)
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                    GLES20.glUseProgram(progPass1)
-                    GLES20.glUniformMatrix4fv(uTexMatrixLoc1, 1, false, texMatrix, 0)
-                    GLES20.glUniform2f(uStepLoc1, stepH, 0f)
-                    GLES20.glUniform1i(uSamplerLoc1, 0)
+                    GLES20.glUseProgram(progBox)
+                    vBuf.position(0); GLES20.glVertexAttribPointer(aPos1,2,GLES20.GL_FLOAT,false,4*4,vBuf); GLES20.glEnableVertexAttribArray(aPos1)
+                    vBuf.position(2); GLES20.glVertexAttribPointer(aTex1,2,GLES20.GL_FLOAT,false,4*4,vBuf); GLES20.glEnableVertexAttribArray(aTex1)
+                    GLES20.glUniformMatrix4fv(uTMBox, 1, false, texMtx, 0)
+                    // Step in normalized display-space
+                    GLES20.glUniform2f(uStepBox, 1f / srcW, 1f / srcH)
+                    GLES20.glUniform1f(uTapXB, tapX.toFloat()); GLES20.glUniform1f(uTapYB, tapY.toFloat())
+                    GLES20.glUniform1i(uSmpBox, 0)
+                    // Pass the crop rectangle exactly as defined in UI (top‑left, positive size)
+                    GLES20.glUniform2f(uCropOri, crop.left, crop.top)
+                    GLES20.glUniform2f(uCropSz,  crop.width, crop.height)
                     GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-                    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId[0])
+                    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesId[0])
                     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-                    // ── Pass 2: FBO → encoder surface (vertical Lanczos) ─────────
+                    // ── Pass B: H-Lanczos (FBO-A → FBO-B) ────────────────────
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboBId)
+                    GLES20.glViewport(0, 0, encFW, encFH)
+                    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                    GLES20.glUseProgram(progLanH)
+                    vBuf.position(0); GLES20.glVertexAttribPointer(aPos2,2,GLES20.GL_FLOAT,false,4*4,vBuf); GLES20.glEnableVertexAttribArray(aPos2)
+                    vBuf.position(2); GLES20.glVertexAttribPointer(aTex2,2,GLES20.GL_FLOAT,false,4*4,vBuf); GLES20.glEnableVertexAttribArray(aTex2)
+                    GLES20.glUniformMatrix4fv(uTMLH, 1, false, identity, 0)
+                    GLES20.glUniform2f(uStepLH, stepCropX, 0f)
+                    GLES20.glUniform1i(uSmpLH, 0)
+                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboATex)
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+                    // ── Pass C: V-Lanczos (FBO-B → encoder) ──────────────────
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                    GLES20.glViewport(0, 0, encFinalWidth, encFinalHeight)
+                    
+                    // Clear the entire encoder frame first (to avoid garbage in bars)
+                    GLES20.glViewport(0, 0, encFW, encFH)
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                    GLES20.glUseProgram(progPass2)
-                    GLES20.glUniformMatrix4fv(uTexMatrixLoc2, 1, false, identityMatrix, 0)
-                    GLES20.glUniform2f(uStepLoc2, 0f, stepV)
-                    val sampLoc2 = GLES20.glGetUniformLocation(progPass2, "uTexture2D")
-                    GLES20.glUniform1i(sampLoc2, 0)
+
+                    // Maintenance exact aspect ratio within the 16-aligned encoder frame to avoid deformation.
+                    val cropAr = cropPxW.toFloat() / cropPxH
+                    val encAr  = encFW.toFloat() / encFH
+                    var vpW = encFW; var vpH = encFH
+                    var vpx = 0; var vpy = 0
+                    if (cropAr > encAr) {
+                        vpH = (encFW / cropAr).roundToInt()
+                        vpy = (encFH - vpH) / 2
+                    } else {
+                        vpW = (encFH * cropAr).roundToInt()
+                        vpx = (encFW - vpW) / 2
+                    }
+                    GLES20.glViewport(vpx, vpy, vpW, vpH)
+                    // We don't clear again here because we already cleared the whole surface
+                    GLES20.glUseProgram(progLanV)
+                    vBuf.position(0); GLES20.glVertexAttribPointer(aPos3,2,GLES20.GL_FLOAT,false,4*4,vBuf); GLES20.glEnableVertexAttribArray(aPos3)
+                    vBuf.position(2); GLES20.glVertexAttribPointer(aTex3,2,GLES20.GL_FLOAT,false,4*4,vBuf); GLES20.glEnableVertexAttribArray(aTex3)
+                    GLES20.glUniformMatrix4fv(uTMLV, 1, false, identity, 0)
+                    GLES20.glUniform2f(uStepLV, 0f, stepCropY)
+                    GLES20.glUniform1i(uSmpLV, 0)
                     GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId[0])
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboBTex)
                     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-                    EGLExt.eglPresentationTimeANDROID(
-                        eglDisplay, eglSurface, surfaceTexture.timestamp
-                    )
-                    EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+                    EGLExt.eglPresentationTimeANDROID(eglDisp, eglSurf, surfTex.timestamp)
+                    EGL14.eglSwapBuffers(eglDisp, eglSurf)
                 }
-
-                decoderOutIdx = decoder.dequeueOutputBuffer(decoderOutInfo, 0)
+                dIdx = decoder.dequeueOutputBuffer(dInfo, 0)
             }
 
-            // ---- Signal encoder EOS after decoder finishes ----------------------
-            if (decoderEos && !sawInputEos) {
-                encoder.signalEndOfInputStream()
-                sawInputEos = true
-                Log.d(TAG, "Encoder EOS signalled")
-            }
+            if (decEos && !sawEos) { encoder.signalEndOfInputStream(); sawEos = true; Log.d(TAG, "Encoder EOS signalled") }
 
-            // ---- Drain encoder --------------------------------------------------
-            val encoderOutInfo = MediaCodec.BufferInfo()
-            var encoderOutIdx  = encoder.dequeueOutputBuffer(encoderOutInfo, 10_000)
-            while (encoderOutIdx != MediaCodec.INFO_TRY_AGAIN_LATER && !cancelFlag.get()) {
+            // Drain encoder
+            val eInfo = MediaCodec.BufferInfo()
+            var eIdx  = encoder.dequeueOutputBuffer(eInfo, 10_000)
+            while (eIdx != MediaCodec.INFO_TRY_AGAIN_LATER && !cancelFlag.get()) {
                 when {
-                    // INFO_OUTPUT_FORMAT_CHANGED: the correct moment to read the
-                    // negotiated output format and start the muxer. Starting on a
-                    // data buffer (old approach) could use a stale format on some
-                    // encoders and would miss this event entirely on others.
-                    encoderOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        if (!muxerStarted) {
-                            val negotiated = encoder.outputFormat
-                            Log.i(TAG, "Encoder output format negotiated: $negotiated")
-                            videoTrackMuxerIndex = muxer.addTrack(negotiated)
-                            muxer.start()
-                            muxerStarted = true
-                            Log.d(TAG, "Muxer started on FORMAT_CHANGED")
-
-                            // Flush audio samples buffered before muxer was ready
-                            if (audioTrackMuxerIndex != -1) {
-                                for (sample in pendingAudio) {
-                                    val buf  = ByteBuffer.wrap(sample.data)
-                                    val info = MediaCodec.BufferInfo().apply {
-                                        size               = sample.data.size
-                                        presentationTimeUs = sample.pts
-                                        flags              = sample.flags
-                                        offset             = 0
-                                    }
-                                    muxer.writeSampleData(audioTrackMuxerIndex, buf, info)
-                                }
+                    eIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        if (!muxStarted) {
+                            vidMuxIdx = muxer.addTrack(encoder.outputFormat)
+                            muxer.start(); muxStarted = true; Log.d(TAG, "Muxer started")
+                            if (audMuxIdx != -1) {
+                                for (s in pendingAudio) muxer.writeSampleData(audMuxIdx, ByteBuffer.wrap(s.data), MediaCodec.BufferInfo().apply { size=s.data.size; presentationTimeUs=s.pts; flags=s.flags; offset=0 })
                                 pendingAudio.clear()
                             }
                         }
                     }
-                    // Real output buffer
-                    encoderOutIdx >= 0 -> {
-                        if (encoderOutInfo.size > 0 && muxerStarted) {
-                            val outputBuffer = encoder.getOutputBuffer(encoderOutIdx)!!
-                            muxer.writeSampleData(videoTrackMuxerIndex, outputBuffer, encoderOutInfo)
+                    eIdx >= 0 -> {
+                        if (eInfo.size > 0 && muxStarted) {
+                            // Re-zero PTS relative to trim start
+                            val adjustedPts = (eInfo.presentationTimeUs - ptsOffsetUs).coerceAtLeast(0L)
+                            val adjustedInfo = MediaCodec.BufferInfo().apply { size=eInfo.size; presentationTimeUs=adjustedPts; flags=eInfo.flags; offset=eInfo.offset }
+                            muxer.writeSampleData(vidMuxIdx, encoder.getOutputBuffer(eIdx)!!, adjustedInfo)
                         }
-                        encoder.releaseOutputBuffer(encoderOutIdx, false)
-
-                        if (encoderOutInfo.presentationTimeUs > 0) {
-                            lastEncodedPts = encoderOutInfo.presentationTimeUs
-                        }
-                        if (encoderOutInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                            encoderEos = true
-                            Log.d(TAG, "Encoder EOS received")
-                        }
+                        encoder.releaseOutputBuffer(eIdx, false)
+                        if (eInfo.presentationTimeUs > 0) lastEncPts = eInfo.presentationTimeUs - ptsOffsetUs
+                        if (eInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) { encEos = true; Log.d(TAG, "Encoder EOS received") }
                     }
                 }
-                encoderOutIdx = encoder.dequeueOutputBuffer(encoderOutInfo, 0)
+                eIdx = encoder.dequeueOutputBuffer(eInfo, 0)
             }
 
-            // ---- Progress -------------------------------------------------------
-            // Use lastEncodedPts (updated inside the drain loop) rather than
-            // encoderOutInfo.presentationTimeUs, which is 0 on most iterations
-            // because the encoder dequeue timed out. The old approach caused
-            // artificially uniform 2%-per-second increments.
-            if (totalDurationUs > 0 && lastEncodedPts > 0) {
-                val prog = (lastEncodedPts.toFloat() / totalDurationUs).coerceIn(0f, 1f)
-                if (prog - lastProgress > 0.01f) {
-                    lastProgress = prog
-                    progressHandler.post { onProgress(prog) }
-                }
+            // Progress
+            if (totalDurUs > 0 && lastEncPts > 0) {
+                val prog = (lastEncPts.toFloat() / totalDurUs).coerceIn(0f, 1f)
+                if (prog - lastProg > 0.01f) { lastProg = prog; progHandler.post { onProgress(prog) } }
             }
 
-            // ---- Audio passthrough ----------------------------------------------
-            // FIX (Bug A): drain ALL available audio samples each iteration, not
-            // just one. Without this the audio extractor falls far behind on any
-            // video with dense audio, causing the while-loop to spin thousands of
-            // extra iterations after encoderEos is set, and audio may be truncated.
-            audioExtractor?.let { ae ->
+            // Audio passthrough with trim + PTS offset
+            audioExt?.let { ae ->
                 while (!audioEos && !cancelFlag.get()) {
-                    // FIX (Bug B): always reset to pristine write-mode before each
-                    // readSampleData call so position/limit are never stale.
-                    audioBuffer.clear()
-                    val sampleSize = ae.readSampleData(audioBuffer, 0)
-                    if (sampleSize < 0) {
-                        // FIX (Bug 4): never write a 0-byte sentinel — MediaMuxer
-                        // throws IllegalArgumentException on size=0 writes.
-                        audioEos = true
-                        Log.d(TAG, "Audio EOS reached")
-                        break
-                    }
-
-                    lastAudioPts = ae.sampleTime
-                    // Translate MediaExtractor sample flags → MediaCodec buffer flags.
-                    // These are different constants and cannot be passed interchangeably
-                    // to MediaMuxer.writeSampleData(), which expects BUFFER_FLAG_* values.
-                    val extractorFlags = ae.sampleFlags
-                    val flags = (if (extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0)
-                        MediaCodec.BUFFER_FLAG_KEY_FRAME else 0) or
-                            (if (extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME != 0)
-                                MediaCodec.BUFFER_FLAG_PARTIAL_FRAME else 0)
+                    audioBuf.clear()
+                    val sz = ae.readSampleData(audioBuf, 0)
+                    val samplePts = ae.sampleTime
+                    val pastEnd = trimEndUs != null && samplePts > trimEndUs
+                    if (sz < 0 || pastEnd) { audioEos = true; Log.d(TAG, "Audio EOS"); break }
+                    val adjPts = (samplePts - ptsOffsetUs).coerceAtLeast(0L)
+                    val ef = ae.sampleFlags
+                    val flags = (if (ef and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0) or
+                            (if (ef and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME != 0) MediaCodec.BUFFER_FLAG_PARTIAL_FRAME else 0)
                     ae.advance()
-
-                    if (muxerStarted && audioTrackMuxerIndex != -1) {
-                        // Muxer is live — write directly. Set limit exactly so the
-                        // muxer reads only sampleSize bytes from position 0.
-                        audioBuffer.limit(sampleSize).position(0)
-                        val bi = MediaCodec.BufferInfo().apply {
-                            size               = sampleSize
-                            presentationTimeUs = lastAudioPts
-                            this.flags         = flags
-                            offset             = 0
-                        }
-                        muxer.writeSampleData(audioTrackMuxerIndex, audioBuffer, bi)
-                    } else if (audioTrackMuxerIndex != -1) {
-                        // FIX (Bug C): muxer not started yet — copy into a heap
-                        // array so we own the bytes independently of audioBuffer,
-                        // then flush the whole queue once the muxer starts (before
-                        // writing the first video frame) so PTS order is preserved.
-                        audioBuffer.limit(sampleSize).position(0)
-                        val bytes = ByteArray(sampleSize).also { audioBuffer.get(it) }
-                        pendingAudio.addLast(AudioSample(bytes, lastAudioPts, flags))
-                    }
+                    audioBuf.limit(sz).position(0)
+                    val bi = MediaCodec.BufferInfo().apply { size=sz; presentationTimeUs=adjPts; this.flags=flags; offset=0 }
+                    if (muxStarted && audMuxIdx != -1) muxer.writeSampleData(audMuxIdx, audioBuf, bi)
+                    else if (audMuxIdx != -1) { val bytes=ByteArray(sz).also { audioBuf.get(it) }; pendingAudio.addLast(AudioSample(bytes, adjPts, flags)) }
                 }
-            }
-        } // end while
-
-        // ---- Cleanup ------------------------------------------------------------
-        frameCallbackThread.quitSafely()
-
-        decoder.stop()
-        decoder.release()
-        encoder.stop()
-        encoder.release()
-
-        // FIX (Bug 5): release the SurfaceTexture and its wrapper Surface.
-        decoderOutputSurface.release()
-        surfaceTexture.release()
-
-        extractor.release()
-        audioExtractor?.release()
-
-        // FIX (Bug 3): always stop before release; guard both on muxerStarted.
-        if (muxerStarted) {
-            try { muxer.stop() } catch (e: Exception) {
-                Log.w(TAG, "muxer.stop() threw: ${e.message}")
             }
         }
+
+        // ── Cleanup ───────────────────────────────────────────────────────────
+        cbThread.quitSafely()
+        decoder.stop(); decoder.release()
+        encoder.stop(); encoder.release()
+        decSurf.release(); surfTex.release()
+        extractor.release(); audioExt?.release()
+        if (muxStarted) try { muxer.stop() } catch (e: Exception) { Log.w(TAG, "muxer.stop: ${e.message}") }
         muxer.release()
 
-        EGL14.eglMakeCurrent(
-            eglDisplay,
-            EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE,
-            EGL14.EGL_NO_CONTEXT
-        )
-        EGL14.eglDestroySurface(eglDisplay, eglSurface)
-        EGL14.eglDestroyContext(eglDisplay, eglContext)
-        EGL14.eglTerminate(eglDisplay)
-        GLES20.glDeleteProgram(progPass1)
-        GLES20.glDeleteProgram(progPass2)
-        GLES20.glDeleteTextures(1, textureId, 0)
-        GLES20.glDeleteTextures(1, fboTexId, 0)
-        GLES20.glDeleteFramebuffers(1, fboId, 0)
+        EGL14.eglMakeCurrent(eglDisp, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        EGL14.eglDestroySurface(eglDisp, eglSurf)
+        EGL14.eglDestroyContext(eglDisp, eglCtx)
+        EGL14.eglTerminate(eglDisp)
 
-        if (cancelFlag.get()) {
-            File(outputPath).delete()
-            progressHandler.post { onCancelled() }
-        } else {
-            progressHandler.post {
-                onProgress(1f)
-                onSuccess()
-            }
-        }
+        GLES20.glDeleteProgram(progBox); GLES20.glDeleteProgram(progLanH); GLES20.glDeleteProgram(progLanV)
+        GLES20.glDeleteTextures(1, oesId, 0)
+        GLES20.glDeleteTextures(1, intArrayOf(fboATex), 0); GLES20.glDeleteTextures(1, intArrayOf(fboBTex), 0)
+        GLES20.glDeleteFramebuffers(1, intArrayOf(fboAId), 0); GLES20.glDeleteFramebuffers(1, intArrayOf(fboBId), 0)
+
+        if (cancelFlag.get()) { File(outputPath).delete(); progHandler.post { onCancelled() } }
+        else progHandler.post { onProgress(1f); onSuccess() }
     }
 
-    // --- Helpers -----------------------------------------------------------------
-
-    private fun isCbrSupported(mime: String, encoderName: String): Boolean {
-        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        for (ci in codecList.codecInfos) {
-            if (ci.name != encoderName || !ci.isEncoder) continue
-            val ec = try { ci.getCapabilitiesForType(mime).encoderCapabilities }
-            catch (e: Exception) { return false }
-            return ec.isBitrateModeSupported(
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-        }
-        return false
-    }
-
-    private fun alignTo16(value: Int): Int = (value + 15) / 16 * 16
+    private fun alignTo16(v: Int) = (v + 15) / 16 * 16
 }

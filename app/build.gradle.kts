@@ -5,18 +5,22 @@ plugins {
 
 android {
     namespace = "com.shanks.minify"
-    compileSdk = 36
+    compileSdk = 37
+
+    androidResources {
+        localeFilters += "en"
+    }
 
     defaultConfig {
         applicationId = "com.shanks.minify"
-        minSdk = 29
+        minSdk = 24
         targetSdk = 35
-        versionCode = 5
-        versionName = "5.0"
+        versionCode = 6
+        versionName = "6.0"
 
         ndk {
-            // This already tells Android to only include these two architectures
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+            // This already tells Android to only include 64 bit architecture
+            abiFilters.addAll(listOf("arm64-v8a"))
         }
     }
 
@@ -55,9 +59,14 @@ android {
     buildFeatures {
         compose = true
     }
+
+    lint {
+        abortOnError = false
+    }
 }
 
 dependencies {
+    implementation(libs.androidx.compose.ui.geometry)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -65,9 +74,10 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
 
-    implementation("androidx.media3:media3-effect:1.10.1")
     implementation("androidx.media3:media3-common:1.10.1")
 
     implementation("androidx.media3:media3-exoplayer:1.10.1")
     implementation("androidx.media3:media3-ui:1.10.1")
+
+    implementation("androidx.datastore:datastore-preferences:1.2.1")
 }

@@ -1,13 +1,3 @@
-# --- FFmpegKit Core ---
-# Prevents stripping the JNI bridge and core logic
--keep class com.arthenica.ffmpegkit.** { *; }
--keep interface com.arthenica.ffmpegkit.** { *; }
--dontwarn com.arthenica.ffmpegkit.**
-
-# Support for SmartException (hyphenated package fix)
--keep class com.arthenica.** { *; }
--dontwarn com.arthenica.**
-
 # --- Native Method Handling ---
 # CRITICAL: Keeps the link between Java and C++ code
 -keepclasseswithmembernames class * {

@@ -13,16 +13,21 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
-fun FileSection(selectedUri: Uri?, onSelect: (Uri) -> Unit) {
+fun FileSection(
+    selectedUri: Uri?,
+    enabled: Boolean = true,             // ← new
+    onSelect: (Uri) -> Unit
+) {
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri -> uri?.let(onSelect) }
 
     OutlinedCard(
-        onClick = { launcher.launch("video/*") },
+        onClick = { if (enabled) launcher.launch("video/*") },  // ← guard
+        enabled = enabled,                                        // ← greyed out visually
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier.fillMaxWidth(),
-        border = CardDefaults.outlinedCardBorder()
+        border = CardDefaults.outlinedCardBorder(enabled = enabled)
     ) {
         Row(
             modifier = Modifier
@@ -31,7 +36,6 @@ fun FileSection(selectedUri: Uri?, onSelect: (Uri) -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Use a text emoji to avoid any dependency on material-icons-extended
             Text(
                 text = "🎬",
                 fontSize = 28.sp
@@ -41,22 +45,26 @@ fun FileSection(selectedUri: Uri?, onSelect: (Uri) -> Unit) {
                     text = if (selectedUri == null) "No video selected" else "Video selected",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurface
+                        .copy(alpha = if (enabled) 1f else 0.38f)
                 )
                 Text(
                     text = if (selectedUri == null) "Tap to pick a video" else "Tap to change",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                    color = MaterialTheme.colorScheme.onSurface
+                        .copy(alpha = if (enabled) 0.5f else 0.28f)
                 )
             }
             if (selectedUri != null) {
                 Surface(
                     shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                    color = MaterialTheme.colorScheme.primary
+                        .copy(alpha = if (enabled) 0.12f else 0.06f)
                 ) {
                     Text(
                         "✓",
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                         color = MaterialTheme.colorScheme.primary
+                            .copy(alpha = if (enabled) 1f else 0.38f)
                     )
                 }
             }
