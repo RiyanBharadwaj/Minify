@@ -16,33 +16,33 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.shanks.minify.ui.editor.model.CropDrag
 import kotlin.math.abs
 
 private const val HANDLE_TOUCH_RADIUS_FRAC = 0.14f
-private const val MIN_CROP_FRAC = 0.08f
 
 enum class DragHandle {
     TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT,
     TOP, BOTTOM, LEFT, RIGHT, BODY, NONE
 }
 
-private fun clampCrop(l: Float, t: Float, r: Float, b: Float): CropRect {
-    var cl = l.coerceIn(0f, 1f)
-    var ct = t.coerceIn(0f, 1f)
-    var cr = r.coerceIn(0f, 1f)
-    var cb = b.coerceIn(0f, 1f)
-
-    if (cr - cl < MIN_CROP_FRAC) {
-        cr = (cl + MIN_CROP_FRAC).coerceAtMost(1f)
-        cl = (cr - MIN_CROP_FRAC).coerceAtLeast(0f)
+/**
+ * The letterboxed content rectangle (in canvas pixels) that the actual media
+ * occupies inside a [cw] x [ch] canvas for a media aspect ratio derived from
+ * [iw] x [ih]. For small images (smaller than the canvas), the rule is
+ * "Inside" (native size, centered, no upscale). For large images it scales
+ * down to fit (FIT_CENTER).
+ */
+private fun contentRect(cw: Float, ch: Float, iw: Int, ih: Int): androidx.compose.ui.geometry.Rect {
+    if (iw <= 0 || ih <= 0 || cw <= 0f || ch <= 0f) {
+        return androidx.compose.ui.geometry.Rect(0f, 0f, cw, ch)
     }
-
-    if (cb - ct < MIN_CROP_FRAC) {
-        cb = (ct + MIN_CROP_FRAC).coerceAtMost(1f)
-        ct = (cb - MIN_CROP_FRAC).coerceAtLeast(0f)
-    }
-
-    return CropRect(cl, ct, cr, cb)
+    val scale = minOf(1f, cw / iw.toFloat(), ch / ih.toFloat())
+    val fittedW = iw * scale
+    val fittedH = ih * scale
+    val ox = (cw - fittedW) / 2f
+    val oy = (ch - fittedH) / 2f
+    return androidx.compose.ui.geometry.Rect(ox, oy, ox + fittedW, oy + fittedH)
 }
 
 @Composable
@@ -50,8 +50,11 @@ fun CropOverlay(
     crop: CropRect,
     lockedAspect: Float?,
     videoAspect: Float,
+    imageWidth: Int,
+    imageHeight: Int,
     onCropChange: (CropRect) -> Unit,
     modifier: Modifier = Modifier,
+    mirrored: Boolean = false,
     overlayColor: Color = Color(0x88000000),
     borderColor: Color = Color.White,
     handleColor: Color = Color.White,
@@ -63,6 +66,9 @@ fun CropOverlay(
     val latestCrop         by rememberUpdatedState(crop)
     val latestLockedAspect by rememberUpdatedState(lockedAspect)
     val latestCanvasSize   by rememberUpdatedState(canvasSize)
+    val latestWidth        by rememberUpdatedState(imageWidth)
+    val latestHeight       by rememberUpdatedState(imageHeight)
+    val latestMirrored     by rememberUpdatedState(mirrored)
 
     Box(modifier = modifier.onSizeChanged { canvasSize = it }) {
         Canvas(
@@ -73,13 +79,16 @@ fun CropOverlay(
                         onDragStart = { offset ->
                             val cs = latestCanvasSize
                             if (cs == IntSize.Zero) return@detectDragGestures
-                            val cw     = cs.width.toFloat()
-                            val ch     = cs.height.toFloat()
-                            val l      = latestCrop.left   * cw
-                            val t      = latestCrop.top    * ch
-                            val r      = latestCrop.right  * cw
-                            val b      = latestCrop.bottom * ch
-                            val touchR = HANDLE_TOUCH_RADIUS_FRAC * minOf(cw, ch)
+                            // Crop coordinates are relative to the media content rect
+                            // (letterbox-corrected), not the full canvas.
+                            val content = contentRect(cs.width.toFloat(), cs.height.toFloat(), latestWidth, latestHeight)
+                            val fw     = content.width
+                            val fh     = content.height
+                            val l      = content.left + latestCrop.left   * fw
+                            val t      = content.top  + latestCrop.top    * fh
+                            val r      = content.left + latestCrop.right  * fw
+                            val b      = content.top  + latestCrop.bottom * fh
+                            val touchR = HANDLE_TOUCH_RADIUS_FRAC * minOf(fw, fh)
 
                             activeDrag = when {
                                 offset.distanceTo(Offset(l, t)) < touchR                    -> DragHandle.TOP_LEFT
@@ -99,77 +108,46 @@ fun CropOverlay(
                         onDrag = { _, dragAmount ->
                             val cs = latestCanvasSize
                             if (activeDrag == DragHandle.NONE || cs == IntSize.Zero) return@detectDragGestures
-                            val cw = cs.width.toFloat()
-                            val ch = cs.height.toFloat()
-                            val dx = dragAmount.x / cw
-                            val dy = dragAmount.y / ch
+                            val content = contentRect(cs.width.toFloat(), cs.height.toFloat(), latestWidth, latestHeight)
+                            // Normalize the drag against the media content rect so a drag maps
+                            // to the same fraction of the media regardless of letterboxing.
+                            // These deltas are in display space, matching CropDrag's contract.
+                            val cw = content.width.coerceAtLeast(1f)
+                            val ch = content.height.coerceAtLeast(1f)
+                            val dNormX = dragAmount.x / cw
+                            val dNormY = dragAmount.y / ch
 
-                            var l = latestCrop.left
-                            var t = latestCrop.top
-                            var r = latestCrop.right
-                            var b = latestCrop.bottom
-
-                            when (activeDrag) {
-                                DragHandle.TOP_LEFT     -> { l += dx; t += dy }
-                                DragHandle.TOP_RIGHT    -> { r += dx; t += dy }
-                                DragHandle.BOTTOM_LEFT  -> { l += dx; b += dy }
-                                DragHandle.BOTTOM_RIGHT -> { r += dx; b += dy }
-                                DragHandle.LEFT         -> { l += dx }
-                                DragHandle.RIGHT        -> { r += dx }
-                                DragHandle.TOP          -> { t += dy }
-                                DragHandle.BOTTOM       -> { b += dy }
-                                DragHandle.BODY -> {
-                                    val w = r - l; val h = b - t
-                                    l = (l + dx).coerceIn(0f, 1f - w)
-                                    t = (t + dy).coerceIn(0f, 1f - h)
-                                    r = l + w; b = t + h
-                                }
-                                DragHandle.NONE -> {}
-                            }
-
-                            val clamped = clampCrop(l, t, r, b)
-                            var cl = clamped.left
-                            var ct = clamped.top
-                            var cr = clamped.right
-                            var cb = clamped.bottom
-
+                            // The locked aspect is a media-space ratio; convert it to the
+                            // normalized crop space CropDrag operates in (divide by the
+                            // content rect's own aspect).
                             val locked = latestLockedAspect
-                            if (locked != null && activeDrag != DragHandle.BODY) {
-                                val newW = cr - cl
-                                val newH = cb - ct
-                                val canvasAr = cw / ch
-                                val targetNormAr = locked / canvasAr
-                                when (activeDrag) {
-                                    DragHandle.TOP_LEFT, DragHandle.BOTTOM_LEFT, DragHandle.LEFT -> {
-                                        val h2 = (newW / targetNormAr).coerceAtLeast(MIN_CROP_FRAC)
-                                        when (activeDrag) {
-                                            DragHandle.TOP_LEFT -> ct = (cb - h2).coerceAtLeast(0f)
-                                            else                -> cb = (ct + h2).coerceAtMost(1f)
-                                        }
-                                    }
-                                    else -> {
-                                        val w2 = (newH * targetNormAr).coerceAtLeast(MIN_CROP_FRAC)
-                                        when (activeDrag) {
-                                            DragHandle.TOP_RIGHT, DragHandle.RIGHT -> cr = (cl + w2).coerceAtMost(1f)
-                                            else                                   -> cl = (cr - w2).coerceAtLeast(0f)
-                                        }
-                                    }
-                                }
-                                val final = clampCrop(cl, ct, cr, cb)
-                                cl = final.left; ct = final.top; cr = final.right; cb = final.bottom
-                            }
+                            val lockedNormAspect = if (locked != null) locked / (cw / ch) else null
 
-                            onCropChange(CropRect(cl, ct, cr, cb))
+                            onCropChange(
+                                CropDrag.resolve(
+                                    crop = latestCrop,
+                                    handle = activeDrag,
+                                    dNormX = dNormX,
+                                    dNormY = dNormY,
+                                    mirrored = latestMirrored,
+                                    lockedNormAspect = lockedNormAspect,
+                                )
+                            )
                         }
                     )
                 }
         ) {
             val cw   = size.width
             val ch   = size.height
-            val l    = crop.left   * cw
-            val t    = crop.top    * ch
-            val r    = crop.right  * cw
-            val b    = crop.bottom * ch
+            // Position the crop within the letterbox-corrected media content rect
+            // so the drawn selection lines up with the visible media.
+            val content = contentRect(cw, ch, imageWidth, imageHeight)
+            val fw   = content.width
+            val fh   = content.height
+            val l    = content.left + crop.left   * fw
+            val t    = content.top  + crop.top    * fh
+            val r    = content.left + crop.right  * fw
+            val b    = content.top  + crop.bottom * fh
             val selW = r - l
             val selH = b - t
 

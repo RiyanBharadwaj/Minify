@@ -1,0 +1,12 @@
+- [x] Native Video Editing & Icon Branding
+    - [/] App Icon Setup
+        - [ ] Save new icon design (User input needed for file path)
+        - [x] Update adaptive icon XMLs
+    - [x] Native Video Editor Implementation
+        - [x] Create `NativeVideoEditor.kt` with Trim and Crop
+        - [x] Integrate into `MainScreen.kt`
+    - [x] Resource Cleanup
+        - [x] Identify and remove unused `ic_*.xml` files
+    - [ ] Verification
+        - [ ] Build and verify APK size
+        - [x] Test trim/crop functionality (In-code)

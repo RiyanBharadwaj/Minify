@@ -21,7 +21,7 @@ object CodecAvailability {
 
         when {
             encoder == null ->
-                CodecStatus(false, false, "not supported on this device")
+                CodecStatus(supported = false, isHardware = false, unavailableReason = "not supported on this device")
             isKnownSoftwareEncoder(encoder.name) ->
                 CodecStatus(false, false, "necessary hardware doesn't exist")
             else ->

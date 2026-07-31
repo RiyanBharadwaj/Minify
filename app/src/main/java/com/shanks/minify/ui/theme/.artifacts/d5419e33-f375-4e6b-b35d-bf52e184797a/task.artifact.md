@@ -1,0 +1,3 @@
+- [x] Update `VideoComparator.kt` to use `MaterialTheme.colorScheme.primary`
+- [x] Remove unused `AccentPurple` import from `ImageComparator.kt`
+- [x] Verify changes with `analyze_file`

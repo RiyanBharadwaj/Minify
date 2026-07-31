@@ -2,8 +2,29 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Voice-over recording / audio import for the integrated video editor. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <queries>
+        <intent>
+            <action android:name="android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION" />
+            <data android:scheme="package" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="true"
@@ -17,7 +38,6 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="@string/app_name"
             android:theme="@style/Theme.Minify">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -25,6 +45,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".media3.CompressionService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Production AdMob App ID -->
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-7808044311175217~8032059911"/>
     </application>
 
 </manifest>

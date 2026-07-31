@@ -4,8 +4,8 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -22,19 +22,16 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.core.graphics.toColorInt
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.graphics.ColorUtils
-import com.shanks.minify.ui.theme.AppAccent
+import com.shanks.minify.ui.theme.*
 import kotlin.math.roundToInt
 
-private val ScreenBg = Color(0xFF0D0B14)
-private val Surface1 = Color(0xFF1A1625)
-private val Surface2 = Color(0xFF251E35)
 private val TextPrim = Color(0xFFFFFFFF)
 private val TextSec  = Color(0xFF8E8E93)
 
@@ -56,7 +53,7 @@ private fun colorToHex(c: Color): String {
 
 private fun hexToColor(hex: String): Color? = try {
     val clean = hex.trimStart('#').padStart(6, '0').take(6)
-    Color(android.graphics.Color.parseColor("#$clean"))
+    Color("#$clean".toColorInt())
 } catch (_: Exception) { null }
 
 // ── Screen ────────────────────────────────────────────────────────────────────
@@ -81,14 +78,12 @@ fun SettingsScreen(
     var saturation by remember(currentAccentColor) { mutableFloatStateOf(initHsv[1]) }
     var value      by remember(currentAccentColor) { mutableFloatStateOf(initHsv[2]) }
     var hexInput   by remember(currentAccentColor) { mutableStateOf(colorToHex(currentAccentColor)) }
-    var hexError   by remember { mutableStateOf(false) }
+    var hexError   by remember { mutableStateOf(value = false) }
 
     val pickedColor by remember(hue, saturation, value) { derivedStateOf { hsvToColor(hue, saturation, value) } }
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(ScreenBg)
+        modifier = Modifier.fillMaxSize().background(BgDark)
     ) {
         Column(
             modifier = Modifier
@@ -179,7 +174,7 @@ fun SettingsScreen(
                             }
                         }
 
-                        Divider(color = Surface2, modifier = Modifier.padding(vertical = 4.dp))
+                        HorizontalDivider(color = Surface2, modifier = Modifier.padding(vertical = 4.dp))
 
                         // ── Custom colour picker ──────────────────────────────
                         Text(
@@ -234,7 +229,7 @@ fun SettingsScreen(
                                 onValueChange = { raw ->
                                     hexInput = raw.filter { it.isLetterOrDigit() }.take(6).uppercase()
                                     val parsed = hexToColor(hexInput)
-                                    hexError = hexInput.length == 6 && parsed == null
+                                    hexError = (hexInput.length == 6 && parsed == null)
                                     if (hexInput.length == 6 && parsed != null) {
                                         val hsv = parsed.toHsv()
                                         hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
@@ -274,7 +269,7 @@ fun SettingsScreen(
                 // ── About ─────────────────────────────────────────────────────
                 SettingsSection(title = "About") {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        InfoRow("App version",      "Minify V6-Stable")
+                        InfoRow("App version",      "Minify V7-Experimental")
                         InfoRow("Developer",   "Riyan Bharadwaj")
                         InfoRow("Official page", "github.com/riyanbharadwaj/minify")
                     }
@@ -295,8 +290,6 @@ private fun SatValSquare(
     modifier: Modifier = Modifier,
 ) {
     var size by remember { mutableStateOf(IntSize.Zero) }
-    val latestSat   by rememberUpdatedState(saturation)
-    val latestVal   by rememberUpdatedState(value)
     val latestOnChanged by rememberUpdatedState(onChanged)
 
     Box(
@@ -306,7 +299,7 @@ private fun SatValSquare(
                 fun handle(offset: Offset) {
                     if (size == IntSize.Zero) return
                     val s = (offset.x / size.width).coerceIn(0f, 1f)
-                    val v = (1f - offset.y / size.height).coerceIn(0f, 1f)
+                    val v = (1f - (offset.y / size.height)).coerceIn(0f, 1f)
                     latestOnChanged(s, v)
                 }
                 detectTapGestures { handle(it) }
@@ -316,14 +309,14 @@ private fun SatValSquare(
                     onDragStart = { offset: Offset ->
                         if (size == IntSize.Zero) return@detectDragGestures
                         val s = (offset.x / size.width).coerceIn(0f, 1f)
-                        val v = (1f - offset.y / size.height).coerceIn(0f, 1f)
+                        val v = (1f - (offset.y / size.height)).coerceIn(0f, 1f)
                         latestOnChanged(s, v)
                     },
-                    onDrag = { change: androidx.compose.ui.input.pointer.PointerInputChange, _: Offset ->
+                    onDrag = { change, _ ->
                         change.consume()
                         if (size == IntSize.Zero) return@detectDragGestures
                         val s = (change.position.x / size.width).coerceIn(0f, 1f)
-                        val v = (1f - change.position.y / size.height).coerceIn(0f, 1f)
+                        val v = (1f - (change.position.y / size.height)).coerceIn(0f, 1f)
                         latestOnChanged(s, v)
                     }
                 )
@@ -380,29 +373,31 @@ private fun HueSlider(
             )
             .pointerInput(Unit) {
                 detectTapGestures { offset ->
-                    if (width > 0) latestOnChanged((offset.x / width * 360f).coerceIn(0f, 360f))
+                    if (width > 0) latestOnChanged(((offset.x / width) * 360f).coerceIn(0f, 360f))
                 }
             }
             .pointerInput(Unit) {
                 detectDragGestures(
                     onDragStart = { offset: Offset ->
-                        if (width > 0) latestOnChanged((offset.x / width * 360f).coerceIn(0f, 360f))
+                        if (width > 0) latestOnChanged(((offset.x / width) * 360f).coerceIn(0f, 360f))
                     },
-                    onDrag = { change: androidx.compose.ui.input.pointer.PointerInputChange, _: Offset ->
+                    onDrag = { change, _ ->
                         change.consume()
-                        if (width > 0) latestOnChanged((change.position.x / width * 360f).coerceIn(0f, 360f))
+                        if (width > 0) latestOnChanged(((change.position.x / width) * 360f).coerceIn(0f, 360f))
                     }
                 )
             }
     ) {
         // Thumb line
         if (width > 0) {
-            val thumbX = (hue / 360f * width).roundToInt().coerceIn(0, width)
+            val thumbX = ((hue / 360f) * width).roundToInt().coerceIn(0, width)
             Box(
                 modifier = Modifier
-                    .offset(x = with(androidx.compose.ui.platform.LocalDensity.current) {
-                        (thumbX - 10).toDp()
-                    })
+                    .offset(
+                        x = with(androidx.compose.ui.platform.LocalDensity.current) {
+                            (thumbX - 10).toDp()
+                        }
+                    )
                     .size(width = 4.dp, height = 28.dp)
                     .background(Color.White, RoundedCornerShape(2.dp))
             )
@@ -418,7 +413,7 @@ private fun SettingsSection(title: String, content: @Composable ColumnScope.() -
         Text(
             title.uppercase(),
             fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-            color = TextSec, letterSpacing = 1.sp
+            color = TextSec, letterSpacing = 1.sp,
         )
         Card(
             shape  = RoundedCornerShape(16.dp),

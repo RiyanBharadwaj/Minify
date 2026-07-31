@@ -2,47 +2,185 @@ package com.shanks.minify.utils
 
 import android.content.ContentValues
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import androidx.core.net.toUri
+import com.shanks.minify.platform.GalleryStrategy
+import com.shanks.minify.platform.GalleryStrategySelector
 import java.io.File
 
 private const val TAG = "MinifyTrash"
 
-fun saveToGallery(context: Context, file: File): Uri {
-    val resolver   = context.contentResolver
-    val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-    val minifyPath = Environment.DIRECTORY_MOVIES + "/Minify/"
+/** What kind of media is being persisted to the gallery. */
+enum class SaveKind { VIDEO, IMAGE }
 
-    val displayName = "Minify_${System.currentTimeMillis()}_${(1000..9999).random()}.mp4"
+/**
+ * Persists [file] into the device gallery, selecting the correct strategy for
+ * the running API level via [GalleryStrategySelector].
+ *
+ * - [GalleryStrategy.SCOPED_MEDIASTORE] (API 29+): MediaStore `IS_PENDING`
+ *   insert/update flow, targeting `MediaStore.Video` or `MediaStore.Images`
+ *   per [kind].
+ * - [GalleryStrategy.LEGACY_WRITE_EXTERNAL] (API 28): write into the public
+ *   `Movies/Minify` (video) or `Pictures/Minify` (image) directory and register
+ *   the file with MediaStore / trigger a media scan so it appears in the gallery.
+ *
+ * Returns the content [Uri] of the saved media on success. Throws on failure
+ * (after deleting any partial row/file) so the caller can surface an error and
+ * retain the source (Req 1.4, 1.5, 1.6).
+ */
+fun saveToGallery(context: Context, file: File, kind: SaveKind): Uri {
+    val uri = when (GalleryStrategySelector.select(Build.VERSION.SDK_INT)) {
+        GalleryStrategy.SCOPED_MEDIASTORE -> saveScoped(context, file, kind)
+        GalleryStrategy.LEGACY_WRITE_EXTERNAL -> saveLegacy(context, file, kind)
+    }
+    cleanupMinifyTrash(context)
+    return uri
+}
+
+/** Per-[SaveKind] MediaStore + directory + file-naming details. */
+private data class KindSpec(
+    val collection: Uri,
+    val relativePath: String,
+    val publicDir: File,
+    val mimeType: String,
+    val extension: String,
+)
+
+private fun specFor(kind: SaveKind): KindSpec = when (kind) {
+    SaveKind.VIDEO -> KindSpec(
+        collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+        relativePath = Environment.DIRECTORY_MOVIES + "/Minify/",
+        publicDir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+            "Minify",
+        ),
+        mimeType = "video/mp4",
+        extension = "mp4",
+    )
+
+    SaveKind.IMAGE -> KindSpec(
+        collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        relativePath = Environment.DIRECTORY_PICTURES + "/Minify/",
+        publicDir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+            "Minify",
+        ),
+        mimeType = "image/jpeg",
+        extension = "jpg",
+    )
+}
+
+private fun displayNameFor(spec: KindSpec): String =
+    "Minify_${System.currentTimeMillis()}_${(1000..9999).random()}.${spec.extension}"
+
+/**
+ * Scoped-storage save (API 29+). Uses the `IS_PENDING` insert/update flow so the
+ * media is not visible to other apps until the copy completes.
+ */
+private fun saveScoped(context: Context, file: File, kind: SaveKind): Uri {
+    val spec = specFor(kind)
+    val resolver = context.contentResolver
 
     val values = ContentValues().apply {
-        put(MediaStore.Video.Media.DISPLAY_NAME,  displayName)
-        put(MediaStore.Video.Media.MIME_TYPE,     "video/mp4")
-        put(MediaStore.Video.Media.RELATIVE_PATH, minifyPath)
-        put(MediaStore.Video.Media.IS_PENDING,    1)
+        put(MediaStore.MediaColumns.DISPLAY_NAME, displayNameFor(spec))
+        put(MediaStore.MediaColumns.MIME_TYPE, spec.mimeType)
+        put(MediaStore.MediaColumns.RELATIVE_PATH, spec.relativePath)
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
     }
 
-    val uri = resolver.insert(collection, values)
+    val uri = resolver.insert(spec.collection, values)
         ?: throw IllegalStateException(
-            "MediaStore insert failed — storage permission may be missing")
+            "MediaStore insert failed — storage permission may be missing",
+        )
 
     try {
         resolver.openOutputStream(uri)?.use { out ->
             file.inputStream().use { it.copyTo(out) }
-        }
-        resolver.update(uri, ContentValues().apply {
-            put(MediaStore.Video.Media.IS_PENDING, 0)
-        }, null, null)
+        } ?: throw IllegalStateException("Could not open output stream for $uri")
+
+        resolver.update(
+            uri,
+            ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+            null,
+            null,
+        )
     } catch (e: Exception) {
         resolver.delete(uri, null, null)
         throw e
     }
 
-    cleanupMinifyTrash(context)
     return uri
+}
+
+/**
+ * Legacy save (API 28). Writes the file into the public Minify directory and
+ * registers it with MediaStore so it appears in the gallery. `IS_PENDING` is
+ * unsupported pre-29, so it is not used.
+ */
+private fun saveLegacy(context: Context, file: File, kind: SaveKind): Uri {
+    val spec = specFor(kind)
+
+    if (!spec.publicDir.exists() && !spec.publicDir.mkdirs()) {
+        throw IllegalStateException("Could not create ${spec.publicDir.absolutePath}")
+    }
+
+    val target = File(spec.publicDir, displayNameFor(spec))
+
+    try {
+        file.inputStream().use { input ->
+            target.outputStream().use { output -> input.copyTo(output) }
+        }
+    } catch (e: Exception) {
+        target.delete()
+        throw e
+    }
+
+    // Register with MediaStore via a synchronous scan so the gallery sees it.
+    val scanned = scanFile(context, target, spec.mimeType)
+    if (scanned != null) return scanned
+
+    // Fallback: insert a MediaStore row pointing at the file path.
+    return try {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, target.name)
+            put(MediaStore.MediaColumns.MIME_TYPE, spec.mimeType)
+            @Suppress("DEPRECATION")
+            put(MediaStore.MediaColumns.DATA, target.absolutePath)
+        }
+        context.contentResolver.insert(spec.collection, values)
+            ?: target.toUri()
+    } catch (e: Exception) {
+        target.delete()
+        throw e
+    }
+}
+
+/**
+ * Runs a synchronous media scan for [file] and returns the resulting content
+ * [Uri], or null if the scan produced none within the timeout.
+ */
+private fun scanFile(context: Context, file: File, mimeType: String): Uri? {
+    val result = arrayOfNulls<Uri>(1)
+    val latch = java.util.concurrent.CountDownLatch(1)
+    MediaScannerConnection.scanFile(
+        context,
+        arrayOf(file.absolutePath),
+        arrayOf(mimeType),
+    ) { _, uri ->
+        result[0] = uri
+        latch.countDown()
+    }
+    return try {
+        latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        result[0]
+    } catch (_: InterruptedException) {
+        null
+    }
 }
 
 /**
@@ -62,7 +200,7 @@ fun cleanupMinifyTrash(context: Context) {
     )
 
     // ── 1. Filesystem scan (requires MANAGE_EXTERNAL_STORAGE on API 30+) ─────
-    val hasFullAccess = Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+    val hasFullAccess = (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) ||
             Environment.isExternalStorageManager()
 
     if (hasFullAccess && minifyDir.exists() && minifyDir.isDirectory) {

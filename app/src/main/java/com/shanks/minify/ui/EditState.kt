@@ -1,7 +1,8 @@
 package com.shanks.minify.ui
 
+import android.os.Parcelable
 import androidx.compose.runtime.saveable.Saver
-import androidx.compose.runtime.saveable.SaverScope
+import kotlinx.parcelize.Parcelize
 
 /**
  * Holds all user-applied edits. Passed from the editor sheet into the compressor.
@@ -11,14 +12,17 @@ import androidx.compose.runtime.saveable.SaverScope
  * @param cropRect     Normalised crop rectangle in [0,1] space relative to the display frame.
  *                     null = no crop (full frame).
  */
+@Parcelize
 data class EditState(
     val trimStartMs: Long = 0L,
     val trimEndMs: Long? = null,
-    val cropRect: CropRect? = null
-) {
+    val cropRect: CropRect? = null,
+    val splits: List<Long> = emptyList()
+) : Parcelable {
     val hasTrim: Boolean  get() = trimStartMs > 0L || trimEndMs != null
     val hasCrop: Boolean  get() = cropRect != null
-    val hasEdits: Boolean get() = hasTrim || hasCrop
+    val hasSplits: Boolean get() = splits.isNotEmpty()
+    val hasEdits: Boolean get() = hasTrim || hasCrop || hasSplits
 
     companion object {
         /**
@@ -27,7 +31,7 @@ data class EditState(
          */
         val Saver: Saver<EditState, Any> = Saver(
             save = { state ->
-                floatArrayOf(
+                val base = floatArrayOf(
                     state.trimStartMs.toFloat(),
                     state.trimEndMs?.toFloat() ?: -1f,
                     state.cropRect?.left   ?: -1f,
@@ -35,13 +39,18 @@ data class EditState(
                     state.cropRect?.right  ?: -1f,
                     state.cropRect?.bottom ?: -1f,
                 )
+                val splitsArr = state.splits.map { it.toFloat() }.toFloatArray()
+                arrayListOf(base, splitsArr)
             },
             restore = { saved ->
-                val arr = saved as FloatArray
+                val parts = saved as ArrayList<*>
+                val arr = parts[0] as FloatArray
+                val splitsArr = parts[1] as FloatArray
                 EditState(
                     trimStartMs = arr[0].toLong(),
                     trimEndMs   = if (arr[1] < 0f) null else arr[1].toLong(),
-                    cropRect    = if (arr[2] < 0f) null else CropRect(arr[2], arr[3], arr[4], arr[5])
+                    cropRect    = if (arr[2] < 0f) null else CropRect(arr[2], arr[3], arr[4], arr[5]),
+                    splits      = splitsArr.map { it.toLong() }
                 )
             }
         )
@@ -51,12 +60,13 @@ data class EditState(
 /**
  * Normalised crop rectangle. All values in [0, 1] relative to the video's display dimensions.
  */
+@Parcelize
 data class CropRect(
     val left: Float,
     val top: Float,
     val right: Float,
     val bottom: Float
-) {
+) : Parcelable {
     val width: Float  get() = right - left
     val height: Float get() = bottom - top
     val aspectRatio: Float get() = if (height > 0f) width / height else 1f

@@ -2,9 +2,7 @@
 package com.shanks.minify.ui
 
 import android.net.Uri
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -16,33 +14,21 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.shanks.minify.logic.SizeResult
+import com.shanks.minify.logic.SizeSelection
+import com.shanks.minify.ui.theme.*
 import com.shanks.minify.utils.VideoInfo
-import kotlin.math.exp
-import kotlin.math.ln
-import kotlin.math.max
-import kotlin.math.roundToInt
+import kotlin.math.*
 
-private val Surface1  = Color(0xFF1A1625)
-private val Surface2  = Color(0xFF251E35)
-private val TextPrim  = Color(0xFFFFFFFF)
 private val TextSec   = Color(0xFF8E8E93)
-private val ErrorRed  = Color(0xFFFF453A)
-
-private const val ABS_MIN_MB = 1f
-
-// ── Preset helpers using effective (post‑edit) dimensions ───────────────
 
 private fun generatePresets(minMb: Float, maxMb: Float, maxSteps: Int = 6): List<Float> {
     if (maxMb <= minMb) return listOf(minMb)
-    val steps  = maxSteps.coerceAtLeast(2)
+    val steps = maxSteps.coerceAtLeast(2)
     val logMin = ln(minMb.toDouble())
     val logMax = ln(maxMb.toDouble())
-    val raw    = (0 until steps).map { i ->
-        val t = i.toDouble() / (steps - 1)
-        exp(logMin + t * (logMax - logMin)).toFloat()
-    }
-    val rounded  = raw.map { roundToNice(it) }
-    val distinct = rounded.distinct().sorted().toMutableList()
+    val raw = (0 until steps).map { i -> exp(logMin + i.toDouble() / (steps - 1) * (logMax - logMin)).toFloat() }
+    val distinct = raw.map { roundToNice(it) }.distinct().sorted().toMutableList()
     if (distinct.isEmpty()) return listOf(minMb, maxMb)
     distinct[0] = minMb; distinct[distinct.lastIndex] = maxMb
     return distinct.distinct().sorted()
@@ -55,42 +41,50 @@ private fun roundToNice(mb: Float): Float = when {
     else      -> ((mb / 10).roundToInt() * 10).toFloat()
 }
 
-private fun estimatedSrcMb(
-    bitrateKbps: Int,
-    durationSecs: Long
-): Float? {
-    if (durationSecs <= 0 || bitrateKbps <= 0) return null
-    return (bitrateKbps.toFloat() * durationSecs) / 8_000f
-}
-
-private fun buildPresets(
-    bitrateKbps: Int,
-    durationSecs: Long,
-    width: Int,
-    height: Int
-): List<Float> {
-    // Use default fallback if no useful info
-    if (durationSecs <= 0 || bitrateKbps <= 0 || width <= 0 || height <= 0) {
-        return listOf(5f, 10f, 25f, 50f, 100f, 200f)
-    }
-
-    val srcMb = estimatedSrcMb(bitrateKbps, durationSecs) ?: return listOf(5f, 10f, 25f, 50f, 100f, 200f)
+private fun buildPresets(bitrateKbps: Int, durationSecs: Long, width: Int, height: Int): List<Float> {
+    if (durationSecs <= 0 || bitrateKbps <= 0 || width <= 0 || height <= 0) return listOf(5f, 10f, 25f, 50f, 100f, 200f)
+    val srcMb = (bitrateKbps.toFloat() * durationSecs) / 8_000f
     val maxMb = roundToNice(srcMb)
-    val minMb = max(ABS_MIN_MB, roundToNice(srcMb * 0.08f))
-    if (maxMb <= minMb + 0.5f) return listOf(minMb, maxMb).distinct()
-    val rangeMb = maxMb - minMb
-    val steps = when {
-        rangeMb < 3f  -> 2; rangeMb < 8f  -> 3; rangeMb < 20f -> 4
-        rangeMb < 50f -> 5; else           -> 6
+
+    // Sub-1 MB ladder (0.1..0.9 in exact 0.1 MB steps), floored at 0.1 MB (Req 4.1/4.2/4.6).
+    // Only include entries that don't exceed the source size.
+    val smallLadder = SizeSelection.smallTargetPresets().filter { it <= maxMb }
+
+    // Entire achievable range is below 1 MB: use only the sub-1 MB ladder.
+    if (maxMb < 1f) {
+        return smallLadder.ifEmpty { listOf(SizeSelection.ABS_MIN_MB) }
     }
-    return generatePresets(minMb, maxMb, steps)
+
+    // Larger presets: preserve existing log-spaced behaviour from >= 1 MB up.
+    val largeMin = max(1f, roundToNice(srcMb * 0.08f))
+    val largePresets = if (maxMb <= largeMin + 0.5f) {
+        listOf(largeMin, maxMb).distinct()
+    } else {
+        val steps = when {
+            maxMb - largeMin < 3f  -> 2; maxMb - largeMin < 8f  -> 3; maxMb - largeMin < 20f -> 4
+            maxMb - largeMin < 50f -> 5; else -> 6
+        }
+        generatePresets(largeMin, maxMb, steps)
+    }
+
+    // For sources >= 1 MB, do NOT offer the sub-1 MB ladder: shrinking a large
+    // video below 1 MB via a preset makes no sense. Users who genuinely want a
+    // sub-1 MB target can still enter it via the custom-size field. The sub-1 MB
+    // ladder only appears when the whole achievable range is below 1 MB (handled
+    // by the `maxMb < 1f` branch above, i.e. the input itself is under 1 MB).
+    return largePresets
 }
 
 private fun formatPresetLabel(mb: Float): String = when {
     mb >= 1000f -> "${"%.0f".format(mb / 1000f)} GB"
+    mb < 1f -> "${"%.1f".format(SizeSelection.roundToTenth(mb))} MB"   // Req 4.3: 0.1 MB resolution
     mb < 10f && mb != mb.toInt().toFloat() -> "${"%.1f".format(mb)} MB"
     else -> "${mb.toInt()} MB"
 }
+
+/** Render a custom target-size value for the text field, preserving the decimal when sub-integer. */
+private fun formatCustomText(mb: Float): String =
+    if (mb == mb.toInt().toFloat()) mb.toInt().toString() else "%.1f".format(mb)
 
 // ── Composable ──────────────────────────────────────────────────────────
 
@@ -108,8 +102,7 @@ fun FunctionSection(
     codecChoice: CodecChoice,
     onPresetIndex: (Int) -> Unit,
     onCustomSizeMb: (Float?) -> Unit,
-    onStart: (Uri, Float) -> Unit,
-    onStop: () -> Unit
+    onStart: (Uri, Float) -> Unit
 ) {
     val accent = MaterialTheme.colorScheme.primary
 
@@ -131,8 +124,9 @@ fun FunctionSection(
     }
 
     val effectiveMb: Float = customSizeMb ?: presets[clampedIdx]
-    var customText  by remember { mutableStateOf(customSizeMb?.toInt()?.toString() ?: "") }
-    var customError by remember { mutableStateOf(false) }
+    var customText     by remember { mutableStateOf(customSizeMb?.let { formatCustomText(it) } ?: "") }
+    var customErrorMsg by remember { mutableStateOf<String?>(null) }
+    val customError = customErrorMsg != null
 
     Card(
         shape  = RoundedCornerShape(16.dp),
@@ -214,18 +208,24 @@ fun FunctionSection(
                     value         = customText,
                     onValueChange = { raw ->
                         customText = raw
-                        val parsed = raw.trim().toFloatOrNull()
-                        customError = parsed == null || parsed <= 0f
-                        if (!customError && parsed != null) onCustomSizeMb(parsed)
+                        // Parse decimal input via SizeSelection (Req 4.4/4.5/4.7).
+                        when (val result = SizeSelection.validateCustom(raw)) {
+                            is SizeResult.Ok -> {
+                                customErrorMsg = null
+                                onCustomSizeMb(result.mb)   // valid [0.1, ..) passes straight through
+                            }
+                            SizeResult.NotPositive ->
+                                customErrorMsg = "Enter a positive number"
+                            SizeResult.BelowMinimum ->
+                                customErrorMsg = "Minimum size is ${SizeSelection.ABS_MIN_MB} MB"
+                        }
                     },
                     label         = { Text("Custom size (MB)") },
                     isError       = customError,
-                    supportingText = if (customError) {
-                        { Text("Enter a positive number") }
-                    } else null,
+                    supportingText = customErrorMsg?.let { msg -> { Text(msg) } },
                     singleLine    = true,
                     enabled       = !isCompressing && mainEnabled,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     colors        = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor   = accent,
                         focusedLabelColor    = accent,
@@ -249,11 +249,14 @@ fun FunctionSection(
                     checked        = customSizeMb != null,
                     onCheckedChange = { checked ->
                         if (checked) {
-                            val current = presets[clampedIdx]
-                            customText = if (current == current.toInt().toFloat())
-                                current.toInt().toString() else "%.1f".format(current)
+                            val current = SizeSelection.roundToTenth(presets[clampedIdx])
+                            customText = formatCustomText(current)
+                            customErrorMsg = null
                             onCustomSizeMb(current)
-                        } else { onCustomSizeMb(null) }
+                        } else {
+                            customErrorMsg = null
+                            onCustomSizeMb(null)
+                        }
                     },
                     enabled = !isCompressing && mainEnabled,
                     colors  = CheckboxDefaults.colors(
@@ -271,34 +274,22 @@ fun FunctionSection(
 
             Spacer(Modifier.height(8.dp))
 
-            if (isCompressing) {
-                Button(
-                    onClick  = onStop,
-                    enabled  = mainEnabled,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape    = RoundedCornerShape(12.dp),
-                    colors   = ButtonDefaults.buttonColors(
-                        containerColor = ErrorRed,
-                        contentColor   = Color.White
-                    )
-                ) {
-                    Text("Stop Compression", modifier = Modifier.padding(vertical = 4.dp))
-                }
-            } else {
-                Button(
-                    onClick  = { selectedUri?.let { onStart(it, effectiveMb) } },
-                    enabled  = mainEnabled && selectedUri != null && (customSizeMb == null || !customError),
-                    modifier = Modifier.fillMaxWidth(),
-                    shape    = RoundedCornerShape(12.dp),
-                    colors   = ButtonDefaults.buttonColors(
-                        containerColor         = accent,
-                        contentColor           = Color.White,
-                        disabledContainerColor = accent.copy(alpha = 0.38f),
-                        disabledContentColor   = Color.White.copy(alpha = 0.6f)
-                    )
-                ) {
-                    Text("Start Compression", modifier = Modifier.padding(vertical = 4.dp))
-                }
+            // Start control only. This section is hidden entirely during a
+            // Compression_Session (Req 5.1); the cancel control lives in the
+            // always-visible status area (Req 5.6).
+            Button(
+                onClick  = { selectedUri?.let { onStart(it, effectiveMb) } },
+                enabled  = mainEnabled && !isCompressing && selectedUri != null && (customSizeMb == null || !customError),
+                modifier = Modifier.fillMaxWidth(),
+                shape    = RoundedCornerShape(12.dp),
+                colors   = ButtonDefaults.buttonColors(
+                    containerColor         = accent,
+                    contentColor           = Color.White,
+                    disabledContainerColor = accent.copy(alpha = 0.38f),
+                    disabledContentColor   = Color.White.copy(alpha = 0.6f)
+                )
+            ) {
+                Text("Start Compression", modifier = Modifier.padding(vertical = 4.dp))
             }
         }
     }

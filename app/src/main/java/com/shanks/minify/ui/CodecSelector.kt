@@ -8,11 +8,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.shanks.minify.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-private val Surface1 = Color(0xFF1A1625)
-private val Surface2 = Color(0xFF251E35)
 private val TextPrim = Color(0xFFFFFFFF)
 private val TextSec  = Color(0xFF8E8E93)
 
@@ -20,10 +19,10 @@ private val TextSec  = Color(0xFF8E8E93)
 fun CodecSelector(
     selected: CodecChoice,
     onChange: (CodecChoice) -> Unit,
-    enabled: Boolean = true
+    enabled: Boolean = true,
 ) {
     val accent = MaterialTheme.colorScheme.primary
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(value = false) }
 
     val statusMap = remember {
         mutableStateMapOf<CodecChoice, CodecAvailability.CodecStatus>().also { map ->

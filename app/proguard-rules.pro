@@ -1,24 +1,51 @@
 # --- Native Method Handling ---
-# CRITICAL: Keeps the link between Java and C++ code
 -keepclasseswithmembernames class * {
     native <methods>;
 }
 
 # --- Media3 / ExoPlayer ---
-# Keeps necessary components for media playback
--keep class androidx.media3.** { *; }
--dontwarn androidx.media3.**
+# Refined: let R8 shrink parts of Media3 not reachable by code paths.
+# Keep necessary components for playback/transform reflection where applicable.
+-keep class androidx.media3.common.util.UnstableApi
+-keep @androidx.media3.common.util.UnstableApi class *
+-keepclassmembers class * {
+    @androidx.media3.common.util.UnstableApi <methods>;
+    @androidx.media3.common.util.UnstableApi <fields>;
+}
 
 # --- General Optimizations ---
-# Use the default number of passes (1) unless you specifically need more
--optimizationpasses 1
+-optimizationpasses 5
 -allowaccessmodification
--dontpreverify
+-assumenosideeffects class android.util.Log {
+    public static int v(...);
+    public static int d(...);
+}
 
 # --- Jetpack / Lifecycle ---
 -keepclassmembers class * extends androidx.lifecycle.ViewModel {
     <init>(...);
 }
 
-# Keep attributes needed for debugging and generic types
--keepattributes Signature, Exceptions, *Annotation*, SourceFile, LineNumberTable
+# --- Room ---
+-keep class * extends androidx.room.RoomDatabase
+-keep class * extends androidx.room.Entity
+-keep class * extends androidx.room.Dao
+-keep class androidx.room.RoomDatabase
+
+# --- WorkManager ---
+# Keep generated WorkDatabase implementation
+-keep class androidx.work.impl.WorkDatabase_Impl { *; }
+-keep class androidx.work.impl.background.systemalarm.RescheduleReceiver
+-keep class androidx.work.impl.background.systemalarm.ConstraintProxy$*
+-keep class androidx.work.impl.background.systemjob.SystemJobService
+-keep class androidx.work.impl.foreground.SystemForegroundService
+-keep class androidx.work.impl.diagnostics.DiagnosticsReceiver
+
+# --- App Startup ---
+-keep class androidx.startup.InitializationProvider
+-keep class * implements androidx.startup.Initializer
+
+-dontwarn androidx.room.**
+-dontwarn androidx.work.**
+-dontwarn androidx.startup.**
+-dontwarn androidx.media3.**

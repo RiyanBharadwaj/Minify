@@ -26,3 +26,6 @@ val AccentPurple = Color(0xFFBF5AF2)
 val AccentCyan   = Color(0xFF32D2F0)
 val ErrorRed     = Color(0xFFFF453A)
 val GreenOk      = Color(0xFF30D158)
+
+val TextPrim = Color(0xFFFFFFFF)
+val TextSec  = Color(0xFF8E8E93)

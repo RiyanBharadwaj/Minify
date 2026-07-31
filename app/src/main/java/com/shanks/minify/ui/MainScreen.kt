@@ -1,56 +1,15 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
 package com.shanks.minify.ui
 
 import android.net.Uri
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -59,12 +18,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -72,72 +33,184 @@ import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import com.shanks.minify.media3.CompressionJob
+import com.shanks.minify.logic.CodecDefault
+import com.shanks.minify.logic.ProgressClamp
+import com.shanks.minify.ui.editor.video.NativeVideoEditor
+import com.shanks.minify.media3.CompressionMonitor
+import com.shanks.minify.media3.CompressionService
 import com.shanks.minify.media3.VideoCompressor
-import com.shanks.minify.utils.VideoInfo
-import com.shanks.minify.utils.getVideoInfo
-import com.shanks.minify.utils.saveToGallery
+import com.shanks.minify.platform.MediaOperation
+import com.shanks.minify.ui.nav.VideoTabState
+import com.shanks.minify.ui.NativeAdView
+import com.shanks.minify.ui.theme.*
+import com.shanks.minify.utils.*
+import kotlin.reflect.KMutableProperty0
+import kotlin.reflect.KProperty
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.time.Duration.Companion.milliseconds
 
-private val BgDark   = Color(0xFF0D0B14)
-private val Surface1 = Color(0xFF1A1625)
-private val Surface2 = Color(0xFF251E35)
-private val AccentCyan = Color(0xFF32D2F0)
-private val TextPrim = Color(0xFFFFFFFF)
-private val TextSec  = Color(0xFF8E8E93)
-private val ErrorRed = Color(0xFFFF453A)
-private val GreenOk  = Color(0xFF30D158)
+private fun friendlyError(e: Exception): String =
+    friendlyErrorText(e.localizedMessage ?: e.javaClass.simpleName)
 
-private fun friendlyError(e: Exception): String {
-    val msg = e.localizedMessage ?: e.javaClass.simpleName
-    return when {
-        msg.contains("codec", ignoreCase = true) ||
-                msg.contains("CodecInfo", ignoreCase = true) ->
-            "Codec not supported — try a different one."
-        msg.contains("permission", ignoreCase = true) ->
-            "Storage permission denied."
-        msg.contains("space", ignoreCase = true) ||
-                msg.contains("ENOSPC", ignoreCase = true) ->
-            "Not enough storage space."
-        else -> "Compression failed — try a different codec or size."
+/**
+ * Best-effort source byte size for the before/after comparison. Prefers the
+ * provider's declared SIZE column, then falls back to the asset descriptor
+ * length. Returns `null` if the size cannot be determined. Never throws.
+ */
+private fun querySourceBytes(context: android.content.Context, uri: Uri): Long? {
+    try {
+        context.contentResolver
+            .query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    if (idx >= 0 && !cursor.isNull(idx)) {
+                        val size = cursor.getLong(idx)
+                        if (size > 0L) return size
+                    }
+                }
+            }
+    } catch (_: Exception) {
+    }
+    return try {
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+            afd.length.takeIf { it >= 0L }
+        }
+    } catch (_: Exception) {
+        null
     }
 }
 
+/**
+ * Maps an explicit failure reason to user-facing text describing a video
+ * compression failure. The reason originates from VideoCompressor's
+ * preflight/runtime failures and is carried to the UI by the status flow as
+ * "error:<reason>". Unrecognized reasons fall back to a generic message so the
+ * user always gets an actionable hint (Req 2.3, 7.6).
+ */
+private fun friendlyErrorText(msg: String): String = when {
+    // Source metadata unreadable (Req 2.7). Checked before the dimension branch
+    // because the unreadable message also mentions dimensions.
+    msg.contains("unreadable", ignoreCase = true) ||
+        msg.contains("Source video", ignoreCase = true) ->
+        "Source video is unreadable — try a different file."
+    // Invalid target size (Req 2.8): non-positive or larger than the source.
+    msg.contains("Target size", ignoreCase = true) ->
+        "Invalid target size — choose a size between 0.1 MB and the source file size."
+    // Invalid output dimensions / budget (Req 2.9).
+    msg.contains("output budget", ignoreCase = true) ||
+        msg.contains("dimension", ignoreCase = true) ->
+        "Invalid video dimensions — try a different size or crop."
+    // Unsupported codec (Req 2.4).
+    msg.contains("codec", ignoreCase = true) ||
+        msg.contains("CodecInfo", ignoreCase = true) ->
+        "Codec not supported — try a different one."
+    // Stalled export (Req 2.6).
+    msg.contains("stalled", ignoreCase = true) ->
+        "Compression stalled — try again or use a different codec."
+    // No / low storage space.
+    msg.contains("space", ignoreCase = true) ||
+        msg.contains("ENOSPC", ignoreCase = true) ->
+        "Not enough storage space — free up space and try again."
+    msg.contains("permission", ignoreCase = true) ->
+        "Storage permission denied."
+    else -> "Compression failed — try a different codec or size."
+}
+
+// Lets a local `by` delegate read/write a property on VideoTabState. Because
+// the target properties are backed by Compose mutableStateOf, reads made
+// through these delegates still subscribe the composition to state changes,
+// so the existing body can keep using plain `selectedUri`, `editState`, etc.
+private operator fun <T> KMutableProperty0<T>.getValue(thisRef: Any?, property: KProperty<*>): T = get()
+private operator fun <T> KMutableProperty0<T>.setValue(thisRef: Any?, property: KProperty<*>, value: T) = set(value)
+
+/**
+ * Thin wrapper kept so existing callers (e.g. MainActivity) keep compiling
+ * until tab wiring lands (task 12.6). It remembers a session-scoped
+ * [VideoTabState] — seeding the initial codec the same way MainScreen used to —
+ * and delegates to [VideoTab].
+ */
 @Composable
 fun MainScreen(
-    currentAccent: com.shanks.minify.ui.theme.AppAccent,
-    currentAccentColor: androidx.compose.ui.graphics.Color,
-    onAccentChange: (com.shanks.minify.ui.theme.AppAccent, androidx.compose.ui.graphics.Color) -> Unit,
+    currentAccent: AppAccent,
+    currentAccentColor: Color,
+    onAccentChange: (AppAccent, Color) -> Unit,
+) {
+    val videoState = rememberSaveable(saver = VideoTabState.Saver) {
+        VideoTabState(
+            initialCodec = CodecDefault.initialChoice { CodecAvailability.isSupported(it) }
+        )
+    }
+    VideoTab(
+        videoState = videoState,
+        currentAccent = currentAccent,
+        currentAccentColor = currentAccentColor,
+        onAccentChange = onAccentChange,
+    )
+}
+
+/**
+ * The Video tab body. Its user-entered inputs (selected file, size preset,
+ * custom size, codec, edits) are hoisted into [VideoTabState] so they survive
+ * tab switches within a session (Req 3.6). The compression flow observes
+ * [CompressionMonitor], so a running session is unaffected by tab switches
+ * (Req 3.4, 3.7).
+ */
+@Composable
+fun VideoTab(
+    videoState: VideoTabState,
+    currentAccent: AppAccent,
+    currentAccentColor: Color,
+    onAccentChange: (AppAccent, Color) -> Unit,
 ) {
     val context = LocalContext.current
 
-    var selectedUri     by rememberSaveable { mutableStateOf<Uri?>(null) }
+    // Request the SAVE_VIDEO permission set (per API level) before starting a
+    // compression that will save to the gallery; on denial, name the missing
+    // permission and halt so no compression starts and media is left unchanged.
+    val runPermissioned = rememberMediaPermissionRunner(onDenied = { name ->
+        android.widget.Toast.makeText(
+            context,
+            "$name is required to save the compressed video. Operation cancelled.",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
+    })
+
+    // Hoisted user-entered state lives in VideoTabState (survives tab switches).
+    var selectedUri     by videoState::selectedUri
     var videoInfo       by remember { mutableStateOf<VideoInfo?>(null) }
-    var progress        by rememberSaveable { mutableFloatStateOf(0f) }
-    var status          by rememberSaveable { mutableStateOf("") }
-    var sizePresetIdx   by rememberSaveable { mutableIntStateOf(2) }
-    var customSizeMb    by rememberSaveable { mutableStateOf<Float?>(null) }
-    var codecChoice     by rememberSaveable { mutableStateOf(CodecChoice.H264) }
-    var isCompressing   by rememberSaveable { mutableStateOf(false) }
-    var editState       by rememberSaveable(stateSaver = EditState.Saver) { mutableStateOf(EditState()) }
-    var showEditor      by remember { mutableStateOf(false) }
-    var showSettings    by remember { mutableStateOf(false) }
+    
+    val progress        by CompressionMonitor.progress.collectAsStateWithLifecycle()
+    val status          by CompressionMonitor.status.collectAsStateWithLifecycle()
+    val isCompressing   by CompressionMonitor.isCompressing.collectAsStateWithLifecycle()
+    val beforeSizeBytes by CompressionMonitor.beforeSizeBytes.collectAsStateWithLifecycle()
+    val afterSizeBytes  by CompressionMonitor.afterSizeBytes.collectAsStateWithLifecycle()
+    val afterUri        by CompressionMonitor.afterUri.collectAsStateWithLifecycle()
+
+    var sizePresetIdx   by videoState::sizePresetIdx
+    var customSizeMb    by videoState::customSizeMb
+    var codecChoice     by videoState::codecChoice
+
+    var editState       by videoState::editState
+    var showEditor      by rememberSaveable { mutableStateOf(false) }
+    var showSettings    by remember { mutableStateOf(value = false) }
 
     var isPlaying       by remember { mutableStateOf(false) }
     var currentPositionMs by remember { mutableLongStateOf(0L) }
     var playerInstance  by remember { mutableStateOf<ExoPlayer?>(null) }
 
-    var beforeSizeBytes by remember { mutableLongStateOf(0L) }
-    var afterSizeBytes  by remember { mutableLongStateOf(0L) }
     var showCompressionCompleteDialog by remember { mutableStateOf(false) }
 
-    val activeJob = remember { mutableStateOf<CompressionJob?>(null) }
-    val mainEnabled = !showEditor && !showSettings
+    // Full-screen before/after Comparison overlay (Video mode). Opened from the
+    // completion dialog once a compressed output Uri is available (Req 11.1).
+    var showComparison by remember { mutableStateOf(false) }
+
+    val mainEnabled = !showSettings
 
     val effectiveDurationSecs = remember(videoInfo, editState) {
         val full = videoInfo?.durationSecs ?: 0L
@@ -167,14 +240,18 @@ fun MainScreen(
         currentPositionMs = 0L
         playerInstance?.stop()
         playerInstance = null
-        beforeSizeBytes = 0L
-        afterSizeBytes = 0L
+        CompressionMonitor.resetStatus()
     }
+
+    // Root overlay container: keeps the main content, the full-screen editor,
+    // and the full-screen settings as *stacked* siblings so the editor/settings
+    // overlays cover the tab body instead of being laid out beneath it.
+    Box(modifier = Modifier.fillMaxSize()) {
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(BgDark)
+            .background(BgDark),
     ) {
         Column(
             modifier = Modifier
@@ -182,7 +259,7 @@ fun MainScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 18.dp)
                 .padding(top = 56.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             AppHeader(onSettings = { if (mainEnabled) showSettings = true })
 
@@ -190,8 +267,9 @@ fun MainScreen(
                 selectedUri = selectedUri,
                 enabled     = !isCompressing && mainEnabled,
                 onSelect    = { uri ->
-                    if (isCompressing) { activeJob.value?.cancel(); activeJob.value = null; isCompressing = false }
-                    selectedUri = uri; progress = 0f; status = ""
+                    if (isCompressing) { CompressionService.stop(context) }
+                    selectedUri = uri
+                    CompressionMonitor.resetStatus()
                 }
             )
 
@@ -206,20 +284,28 @@ fun MainScreen(
                     editState      = editState,
                     isCompressing  = isCompressing,
                     mainEnabled    = mainEnabled,
-                    onEdit         = { if (mainEnabled) showEditor = true },
+                    onEdit         = { showEditor = true },
                     isPlaying      = isPlaying,
                     onPlayPause    = { isPlaying = it },
                     currentPosition = currentPositionMs,
                     onPositionChanged = { currentPositionMs = it },
-                    onPlayerReady  = { playerInstance = it }
+                    onPlayerReady  = { playerInstance = it },
                 )
             }
 
-            AnimatedVisibility(visible = editState.hasEdits && selectedUri != null) {
+            AnimatedVisibility(visible = (editState.hasEdits && selectedUri != null)) {
                 EditSummaryRow(editState)
             }
 
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            // Size_Picker (FunctionSection) + Codec_Selector leave the tree while a
+            // session runs, and return within 500 ms when it ends (Req 5.1/5.2/5.3/5.4/5.7).
+            // Short enter/exit keeps the show/hide well under the 500 ms bound.
+            AnimatedVisibility(
+                visible = !isCompressing,
+                enter   = fadeIn(tween(200)) + expandVertically(tween(200)),
+                exit    = fadeOut(tween(200)) + shrinkVertically(tween(200))
+            ) {
+              Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 FunctionSection(
                     selectedUri       = selectedUri,
                     videoInfo         = videoInfo,
@@ -234,55 +320,46 @@ fun MainScreen(
                     onPresetIndex     = { sizePresetIdx = it },
                     onCustomSizeMb    = { customSizeMb = it },
                     onStart           = { uri, effectiveMb ->
-                        isCompressing = true; status = ""; progress = 0f
-                        CoroutineScope(Dispatchers.IO).launch {
-                            beforeSizeBytes = try {
-                                context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-                                    if (cursor.moveToFirst()) cursor.getLong(0) else 0L
-                                } ?: 0L
-                            } catch (e: Exception) { 0L }
-                            withContext(Dispatchers.Main) {
-                                val output = File(context.cacheDir, "out_${System.currentTimeMillis()}.mp4")
-                                val job = VideoCompressor.compress(
-                                    context      = context,
-                                    inputUri     = uri,
-                                    outputPath   = output.absolutePath,
-                                    codecChoice  = codecChoice,
-                                    targetSizeMb = effectiveMb,
-                                    editState    = editState,
-                                    onProgress   = { progress = it },
-                                    onSuccess    = {
-                                        afterSizeBytes = output.length()
-                                        try { saveToGallery(context, output); status = "done" }
-                                        catch (e: Exception) { status = "error:Save failed: ${e.localizedMessage}" }
-                                        finally { output.delete() }
-                                        isCompressing = false; activeJob.value = null
-                                    },
-                                    onCancelled  = {
-                                        output.delete(); status = "cancelled"; progress = 0f
-                                        isCompressing = false; activeJob.value = null
-                                    },
-                                    onFailure    = { e ->
-                                        output.delete(); status = "error:${friendlyError(e)}"
-                                        isCompressing = false; activeJob.value = null
-                                    }
-                                )
-                                activeJob.value = job
-                            }
+                        runPermissioned(MediaOperation.SAVE_VIDEO) {
+                            // Drive the shared compression pipeline directly through
+                            // CompressionService, using the user's selected MB budget
+                            // and the tab's current trim/crop EditState (#1, #4).
+                            val outputPath = File(
+                                context.cacheDir,
+                                "editor_out_${System.currentTimeMillis()}.mp4",
+                            ).absolutePath
+                            CompressionService.start(
+                                context = context,
+                                inputUri = uri,
+                                outputPath = outputPath,
+                                codec = codecChoice,
+                                targetSizeMb = effectiveMb,
+                                editState = editState,
+                                beforeSize = querySourceBytes(context, uri) ?: 0L,
+                            )
                         }
-                    },
-                    onStop = { activeJob.value?.cancel() }
+                    }
                 )
                 CodecSelector(
                     selected = codecChoice,
                     onChange = { codecChoice = it },
                     enabled  = !isCompressing && mainEnabled
                 )
+              }
             }
 
             AnimatedVisibility(visible = isCompressing || status.isNotEmpty()) {
-                StatusCard(progress = progress, status = status, isCompressing = isCompressing)
+                // Cancel lives in the always-visible status area so it stays reachable
+                // while the Size_Picker/Codec_Selector are hidden (Req 5.6).
+                StatusCard(
+                    progress      = progress,
+                    status        = status,
+                    isCompressing = isCompressing,
+                    onCancel      = { CompressionService.stop(context) }
+                )
             }
+
+            NativeAdView()
         }
 
         // Stylish compression-complete dialog
@@ -291,8 +368,7 @@ fun MainScreen(
             AlertDialog(
                 onDismissRequest = {
                     showCompressionCompleteDialog = false
-                    status = ""
-                    progress = 0f
+                    CompressionMonitor.resetStatus()
                 },
                 icon = {
                     // Circular icon with checkmark
@@ -316,55 +392,22 @@ fun MainScreen(
                     }
                 },
                 title = {
-                    Text(
-                        text = "Compression Complete",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 20.sp,
-                        color = TextPrim
-                    )
+                    Text("Compression Complete", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = TextPrim)
                 },
                 text = {
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        // Original size
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("Original", color = TextSec, fontSize = 14.sp)
-                            Text(formatFileSize(beforeSizeBytes), color = TextPrim, fontSize = 14.sp)
+                    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        listOf("Original" to beforeSizeBytes, "Compressed" to afterSizeBytes).forEach { (label, size) ->
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(label, color = TextSec, fontSize = 14.sp)
+                                Text(formatFileSize(size), color = TextPrim, fontSize = 14.sp)
+                            }
                         }
-                        // Compressed size
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("Compressed", color = TextSec, fontSize = 14.sp)
-                            Text(formatFileSize(afterSizeBytes), color = TextPrim, fontSize = 14.sp)
-                        }
-                        // Divider
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(1.dp)
-                                .background(accent.copy(alpha = 0.2f))
-                        )
-                        // Reduction
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(accent.copy(alpha = 0.2f)))
                         if (beforeSizeBytes > 0 && afterSizeBytes > 0) {
                             val reduction = ((beforeSizeBytes - afterSizeBytes).toFloat() / beforeSizeBytes * 100).toInt()
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 Text("Reduction", color = TextSec, fontSize = 14.sp)
-                                Text(
-                                    "$reduction%",
-                                    color = GreenOk,
-                                    fontSize = 18.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Text("$reduction%", color = GreenOk, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -373,12 +416,27 @@ fun MainScreen(
                     TextButton(
                         onClick = {
                             showCompressionCompleteDialog = false
-                            status = ""
-                            progress = 0f
+                            CompressionMonitor.resetStatus()
                         },
-                        modifier = Modifier.padding(top = 4.dp)
+                        modifier = Modifier.padding(top = 4.dp),
                     ) {
                         Text("OK", color = accent, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    // Open the before/after Comparison screen in Video mode. Only
+                    // available once both the original and the saved compressed
+                    // output Uris are known (Req 11.1).
+                    if (selectedUri != null && afterUri != null) {
+                        TextButton(
+                            onClick = {
+                                showCompressionCompleteDialog = false
+                                showComparison = true
+                            },
+                            modifier = Modifier.padding(top = 4.dp),
+                        ) {
+                            Text("Compare", color = accent, fontWeight = FontWeight.Bold)
+                        }
                     }
                 },
                 containerColor = Surface1,
@@ -389,19 +447,21 @@ fun MainScreen(
         }
     }
 
-    // Full-screen editor
+    // Full-screen native video editor overlay
     AnimatedVisibility(
-        visible  = showEditor && selectedUri != null && videoInfo != null,
+        visible  = showEditor && selectedUri != null,
         enter    = slideInHorizontally { it },
         exit     = slideOutHorizontally { it },
         modifier = Modifier.fillMaxSize()
     ) {
-        if (selectedUri != null && videoInfo != null) {
-            VideoEditorScreen(
-                uri       = selectedUri!!,
-                videoInfo = videoInfo!!,
-                initial   = editState,
-                onDone    = { newEdit -> editState = newEdit; showEditor = false },
+        selectedUri?.let { uri ->
+            NativeVideoEditor(
+                uri = uri,
+                initialEditState = editState,
+                onDone = { newState ->
+                    editState = newState
+                    showEditor = false
+                },
                 onDismiss = { showEditor = false }
             )
         }
@@ -422,13 +482,33 @@ fun MainScreen(
         )
     }
 
+    // Full-screen before/after Comparison overlay (Video mode). "before" is the
+    // originally selected video; "after" is the saved compressed output surfaced
+    // by the monitor (Req 11.1).
+    AnimatedVisibility(
+        visible  = showComparison && selectedUri != null && afterUri != null,
+        enter    = slideInHorizontally { it },
+        exit     = slideOutHorizontally { it },
+        modifier = Modifier.fillMaxSize()
+    ) {
+        val before = selectedUri
+        val after  = afterUri
+        if (before != null && after != null) {
+            ComparisonScreen(
+                source  = ComparisonSource.Videos(before = before, after = after),
+                onClose = { showComparison = false }
+            )
+        }
+    }
+
+    } // end root overlay Box
+
     LaunchedEffect(status) {
         if (status == "done") {
             showCompressionCompleteDialog = true
         } else if (status == "cancelled" || status.startsWith("error:")) {
-            delay(4000)
-            status = ""
-            progress = 0f
+            delay(duration = 4000.milliseconds)
+            CompressionMonitor.resetStatus()
         }
     }
 }
@@ -447,17 +527,7 @@ private fun AppHeader(onSettings: () -> Unit) {
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .background(
-                        Brush.radialGradient(listOf(AccentCyan, accent)),
-                        CircleShape
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("M", color = Color(0xFF1C1C1E), fontWeight = FontWeight.Black, fontSize = 20.sp)
-            }
+            AppIconImage(modifier = Modifier.size(40.dp))
             Column {
                 Text("Minify", color = TextPrim, fontSize = 26.sp, fontWeight = FontWeight.Black)
                 Text("Video Compressor", color = TextSec, fontSize = 12.sp)
@@ -469,12 +539,15 @@ private fun AppHeader(onSettings: () -> Unit) {
     }
 }
 
+@androidx.media3.common.util.UnstableApi
 internal fun VideoSize.displayAspectRatio(): Float {
-    if (width <= 0 || height <= 0) return 0f
+    if ((width <= 0) || (height <= 0)) return 0f
     val raw = width.toFloat() * pixelWidthHeightRatio / height.toFloat()
-    return if (unappliedRotationDegrees == 90 || unappliedRotationDegrees == 270) 1f / raw else raw
+    @Suppress("DEPRECATION")
+    return if ((unappliedRotationDegrees == 90) || (unappliedRotationDegrees == 270)) 1f / raw else raw
 }
 
+@androidx.media3.common.util.UnstableApi
 @Composable
 private fun PreviewWithEditButton(
     uri: Uri?,
@@ -487,7 +560,7 @@ private fun PreviewWithEditButton(
     onPlayPause: (Boolean) -> Unit,
     currentPosition: Long,
     onPositionChanged: (Long) -> Unit,
-    onPlayerReady: (ExoPlayer) -> Unit
+    onPlayerReady: (ExoPlayer) -> Unit,
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -505,7 +578,7 @@ private fun PreviewWithEditButton(
     LaunchedEffect(isPlaying) { player.playWhenReady = isPlaying }
 
     var sliderPos by remember { mutableFloatStateOf(0f) }
-    var isSeeking by remember { mutableStateOf(false) }
+    var isSeeking by remember { mutableStateOf(value = false) }
     var seekTarget by remember { mutableLongStateOf(-1L) }
 
     val fullDurationMs = videoInfo?.durationSecs?.times(1000L) ?: 0L
@@ -513,7 +586,7 @@ private fun PreviewWithEditButton(
     val trimEndMs     = editState.trimEndMs ?: fullDurationMs
     val displayDurationMs = (trimEndMs - trimStartMs).coerceAtLeast(0L)
 
-    var mediaItemReady by remember { mutableStateOf(false) }
+    var mediaItemReady by remember { mutableStateOf(value = false) }
 
     LaunchedEffect(player) {
         while (true) {
@@ -527,7 +600,7 @@ private fun PreviewWithEditButton(
                     seekTarget = -1L
                 }
             }
-            delay(150)
+            delay(duration = 150.milliseconds)
         }
     }
 
@@ -554,6 +627,7 @@ private fun PreviewWithEditButton(
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
+            @androidx.media3.common.util.UnstableApi
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 playerVideoAr = videoSize.displayAspectRatio()
             }
@@ -575,7 +649,15 @@ private fun PreviewWithEditButton(
                     .build()
             )
             .build()
+        // Swapping the media item (e.g. after adopting an edited video) must
+        // re-prepare the player even though `mediaItemReady` was already
+        // `true` from a prior load — a `true -> true` state write is a no-op
+        // in Compose and would never re-trigger the guarded effect below that
+        // used to gate prepare() on that flag. Preparing directly here, right
+        // after the new item is set, guarantees the edited video is actually
+        // decoded/rendered instead of the stale previous frame lingering.
         player.setMediaItem(mediaItem)
+        player.prepare()
         mediaItemReady = true
     }
 
@@ -621,26 +703,26 @@ private fun PreviewWithEditButton(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
                             val view = android.view.LayoutInflater.from(ctx)
-                                .inflate(com.shanks.minify.R.layout.texture_player_view, null) as PlayerView
+                                .inflate(com.shanks.minify.R.layout.texture_player_view, null, false) as PlayerView
                             view.apply {
                                 useController = false
                                 setBackgroundColor(android.graphics.Color.BLACK)
-                                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                @androidx.media3.common.util.UnstableApi
+                                this.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                             }
                             playerViewRef = view
                             view
-                        },
-                        update = { /* player is set below */ }
-                    )
+                        }
+                    ) { /* player is set below */ }
 
                     LaunchedEffect(playerViewRef, player, mediaItemReady) {
                         val view = playerViewRef ?: return@LaunchedEffect
                         while (!view.isAttachedToWindow) {
-                            delay(50)
+                            delay(50.milliseconds)
                         }
                         view.player = player
-                        delay(300)
-                        if (mediaItemReady && player.playbackState == Player.STATE_IDLE) {
+                        delay(300.milliseconds)
+                        if (mediaItemReady && (player.playbackState == Player.STATE_IDLE)) {
                             player.prepare()
                         }
                     }
@@ -779,21 +861,7 @@ private fun VideoControlBar(
     }
 }
 
-private fun formatDuration(ms: Long): String {
-    val totalSeconds = ms / 1000
-    val minutes = totalSeconds / 60
-    val seconds = totalSeconds % 60
-    return "%d:%02d".format(minutes, seconds)
-}
 
-private fun formatFileSize(bytes: Long): String {
-    return when {
-        bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
-        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
-        else -> "%.2f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
-    }
-}
 
 @Composable
 private fun EditSummaryRow(editState: EditState) {
@@ -835,12 +903,19 @@ private fun Chip(text: String) {
 }
 
 @Composable
-private fun StatusCard(progress: Float, status: String, isCompressing: Boolean) {
+private fun StatusCard(
+    progress: Float,
+    status: String,
+    isCompressing: Boolean,
+    onCancel: () -> Unit = {},
+) {
     val accent = MaterialTheme.colorScheme.primary
     val isDone      = status == "done"
     val isCancelled = status == "cancelled"
     val isError     = status.startsWith("error:")
-    val errorMsg    = if (isError) status.removePrefix("error:") else ""
+    // Map the explicit failure reason carried by the status flow ("error:<reason>")
+    // to friendly, user-facing text (Req 2.3, 7.6).
+    val errorMsg    = if (isError) friendlyErrorText(status.removePrefix("error:")) else ""
 
     val bg = when {
         isDone      -> Color(0xFF0A2A14)
@@ -878,8 +953,9 @@ private fun StatusCard(progress: Float, status: String, isCompressing: Boolean) 
                     fontWeight = FontWeight.Medium
                 )
                 if (isCompressing) {
+                    // Display progress as an integer percentage clamped to [0, 100] (Req 5.5).
                     Text(
-                        "${(progress * 100).toInt()}%",
+                        "${ProgressClamp.toPercent(progress)}%",
                         color    = accentColor,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
@@ -888,11 +964,25 @@ private fun StatusCard(progress: Float, status: String, isCompressing: Boolean) 
             }
             if (isCompressing) {
                 LinearProgressIndicator(
-                    progress          = { progress },
+                    progress          = { progress.coerceIn(0f, 1f) },
                     modifier          = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
                     color             = accentColor,
                     trackColor        = Surface2,
                 )
+                // Always-visible cancel control while a session runs (Req 5.6). The
+                // Size_Picker/Codec_Selector are hidden during compression, so the
+                // cancel must live here in the status area.
+                Button(
+                    onClick  = onCancel,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape    = RoundedCornerShape(12.dp),
+                    colors   = ButtonDefaults.buttonColors(
+                        containerColor = ErrorRed,
+                        contentColor   = Color.White
+                    )
+                ) {
+                    Text("Stop Compression", modifier = Modifier.padding(vertical = 4.dp))
+                }
             }
         }
     }
