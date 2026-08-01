@@ -31,7 +31,7 @@ import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import com.shanks.minify.logic.BitrateBudget
 import com.shanks.minify.logic.BudgetResult
-import com.shanks.minify.logic.TargetSizeValidation
+import com.shanks.minify.logic.TargetClamp
 import com.shanks.minify.logic.VideoBudget
 import com.shanks.minify.ui.CodecAvailability
 import com.shanks.minify.ui.CodecChoice
@@ -181,7 +181,7 @@ object VideoCompressor {
             return CompressionJob(cancelFlag, null)
         }
 
-        // --- Pre-flight: selected codec must be available on this device (Req 2.4). ---
+        // ── Pre-flight: codec availability (still a hard fail) ───────────
         val codecStatus = CodecAvailability.getStatus(codecChoice)
         if (!codecStatus.supported) {
             return failPreflight(
@@ -190,9 +190,16 @@ object VideoCompressor {
             )
         }
 
-        val info = getVideoInfo(context, inputUri)
+        // ── Pre-flight: source metadata (still a hard fail, but now caught)
+        val info = try {
+            getVideoInfo(context, inputUri)
+        } catch (e: Exception) {
+            Log.e(TAG, "getVideoInfo threw for $inputUri", e)
+            return failPreflight(
+                "Source video is unreadable (${e.localizedMessage ?: e.javaClass.simpleName})"
+            )
+        }
 
-        // --- Pre-flight: source metadata must be readable (Req 2.7). ---
         if (info.width <= 0 || info.height <= 0 || info.durationSecs <= 0L) {
             return failPreflight(
                 "Source video is unreadable (dimensions ${info.width}x${info.height}, " +
@@ -200,37 +207,13 @@ object VideoCompressor {
             )
         }
 
-        // --- Pre-flight: target size must be > 0 and <= source size (Req 2.8). ---
-        val targetBytes = (targetSizeMb * BYTES_PER_MB).toLong()
-        val sourceBytes = querySourceBytes(context, inputUri)
-        if (sourceBytes != null) {
-            when (val result = TargetSizeValidation.validate(targetBytes, sourceBytes)) {
-                is TargetSizeValidation.Result.Invalid -> return failPreflight(
-                    when (result.reason) {
-                        TargetSizeValidation.Reason.NON_POSITIVE ->
-                            "Target size must be greater than 0 (got $targetSizeMb MB)"
-                        TargetSizeValidation.Reason.EXCEEDS_SOURCE ->
-                            "Target size ($targetSizeMb MB) is larger than the source file"
-                    }
-                )
-                TargetSizeValidation.Result.Valid -> Unit
-            }
-        } else if (targetBytes <= 0L) {
-            // Source size could not be determined from the input Uri, so only the positivity
-            // half of the check is enforced for this session (the <= source half is skipped).
-            return failPreflight("Target size must be greater than 0 (got $targetSizeMb MB)")
-        }
-
+        // ── Trim: clamp instead of rejecting ─────────────────────────────
         val sourceDurationMs = info.durationSecs * 1000L
-
-        if (editState.trimStartMs >= sourceDurationMs) {
-            return failPreflight("Trim start is outside the source duration")
-        }
-
-        val safeTrimStartMs = editState.trimStartMs.coerceIn(0L, sourceDurationMs)
+        val safeTrimStartMs = editState.trimStartMs.coerceIn(0L, (sourceDurationMs - 1L).coerceAtLeast(0L))
         val safeTrimEndMs: Long? = editState.trimEndMs?.let {
             it.coerceIn(safeTrimStartMs + 1L, sourceDurationMs)
         }
+        // ─────────────────────────────────────────────────────────────────
 
         val globalSpeed = speed?.takeIf { it.isFinite() && it > 0.01f } ?: 1f
 
@@ -251,16 +234,31 @@ object VideoCompressor {
 
         val effectiveDurSecs = (effectiveDurationMs / 1000L).coerceAtLeast(1L)
 
+        // ── AUTO-ADJUST: clamp target to a viable range ──────────────────
+        val sourceBytes = querySourceBytes(context, inputUri)
+        val clampedTargetMb = TargetClamp.clamp(
+            targetSizeMb = targetSizeMb,
+            sourceBytes = sourceBytes ?: 0L,
+            durationSecs = effectiveDurSecs,
+            removeAudio = removeAudio,
+        )
+        if (clampedTargetMb != targetSizeMb) {
+            Log.w(
+                TAG,
+                "Target auto-adjusted: requested=${targetSizeMb}MB → viable=${clampedTargetMb}MB " +
+                        "(duration=${effectiveDurSecs}s, source=${sourceBytes ?: "unknown"}B)"
+            )
+        }
+        // ─────────────────────────────────────────────────────────────────
+
         val crop = editState.cropRect ?: CropRect.FULL
         val cropPxW = (info.width * crop.width).roundToInt().coerceAtLeast(1)
         val cropPxH = (info.height * crop.height).roundToInt().coerceAtLeast(1)
 
-        // --- Pre-flight: the budget must yield valid encoder params/dimensions (Req 2.9). ---
-        // BitrateBudget.compute returns a value instead of throwing, so invalid dimensions
-        // become a routed failure rather than a crash.
+        // ── Budget: fall back to minimum viable instead of failing ───────
         val budget: VideoBudget = when (
             val budgetResult = BitrateBudget.compute(
-                targetSizeMb = targetSizeMb,
+                targetSizeMb = clampedTargetMb,
                 durationSecs = effectiveDurSecs,
                 srcBitrateKbps = info.bitrateKbps,
                 srcWidth = cropPxW,
@@ -271,25 +269,25 @@ object VideoCompressor {
             )
         ) {
             is BudgetResult.Valid -> budgetResult.budget
-            is BudgetResult.Invalid -> return failPreflight(
-                "Cannot compute a valid output budget: ${budgetResult.reason}"
-            )
+            is BudgetResult.Invalid -> {
+                Log.w(
+                    TAG,
+                    "Budget computation failed (${budgetResult.reason}); " +
+                            "falling back to minimum viable budget"
+                )
+                VideoBudget(
+                    videoBitrateBps = MIN_VIDEO_BITRATE_BPS,
+                    audioBitrateBps = if (removeAudio) 0 else MIN_AUDIO_BITRATE_BPS,
+                    outputWidth = MIN_OUTPUT_DIMENSION.coerceAtMost(cropPxW),
+                    outputHeight = MIN_OUTPUT_DIMENSION.coerceAtMost(cropPxH),
+                    outputFps = MIN_OUTPUT_FPS.toFloat(),
+                )
+            }
         }
+        // ─────────────────────────────────────────────────────────────────
 
-        // ── SIZE-DERIVED RATE BUDGET (single-pass size guarantee) ──────────────────
-        //
-        // Anchored to target size + effective (post trim/speed/plan) duration, NOT to
-        // the upstream VideoBudget bitrate, so the encoder can never be asked for an
-        // average bitrate the target cannot hold. VBR still varies instantaneously
-        // around this average — and SizeCalibration pre-biases targetSizeMb upstream
-        // to absorb that overshoot — but it cannot overshoot an average it was never
-        // given. This is the fix for exports returning at/above source size.
-        //
-        // headroom is deliberately 1.0 here: VBR-overshoot compensation lives in
-        // SizeCalibration (applied to targetSizeMb before this function is called).
-        // This clamp is a pure correctness guard, so the two mechanisms do not
-        // double-dip.
-        val targetBits = targetSizeMb.toDouble() * BYTES_PER_MB.toDouble() * 8.0
+        // ── SIZE-DERIVED RATE BUDGET (unchanged logic, uses clampedTargetMb)
+        val targetBits = clampedTargetMb.toDouble() * BYTES_PER_MB.toDouble() * 8.0
         val totalBudgetBps = targetBits / effectiveDurSecs.toDouble()
 
         val rawVideoBitrateBps = (budget.videoBitrateBps + if (removeAudio) budget.audioBitrateBps else 0)
@@ -318,8 +316,7 @@ object VideoCompressor {
             Log.w(
                 TAG,
                 "Bitrate budget (${rawVideoBitrateBps}bps) exceeded the size-derived ceiling " +
-                        "(${videoCeilingBps}bps) for ${targetSizeMb}MB/${effectiveDurSecs}s; clamping. " +
-                        "Verify BitrateBudget.compute is keyed off targetSizeMb, not source bitrate."
+                        "(${videoCeilingBps}bps) for ${clampedTargetMb}MB/${effectiveDurSecs}s; clamping."
             )
         }
         // ── END SIZE-DERIVED RATE BUDGET ───────────────────────────────────────────

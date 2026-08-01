@@ -31,6 +31,8 @@ object SizeCalibration {
             val sourceMb = beforeSizeBytes / BYTES_PER_MB.toFloat()
             adjusted = adjusted.coerceAtMost(sourceMb * TARGET_AIM)
         }
+        // The duration-aware minimum is enforced later in VideoCompressor.compress
+        // via TargetClamp.clamp(), which has access to effective duration.
         return adjusted.coerceAtLeast(0.1f)
     }
 

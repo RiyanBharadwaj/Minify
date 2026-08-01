@@ -28,17 +28,10 @@ sealed interface CompressionRequest {
     data class Invalid(val reason: String) : CompressionRequest
 
     companion object {
-        /**
-         * Validate the already-extracted intent extras.
-         *
-         * Returns [Invalid] (never throws) when:
-         *  - [inputUri] is null or blank
-         *  - [outputPath] is null or blank
-         *  - [codecName] is null or does not correspond to a valid [CodecChoice]
-         *  - [editStatePresent] is false
-         *
-         * Otherwise returns [Valid] with the parsed fields.
-         */
+
+        private const val BYTES_PER_MB = 1_048_576L
+        private const val ABSOLUTE_MIN_MB = 0.1f
+
         fun fromExtras(
             inputUri: String?,
             outputPath: String?,
@@ -61,24 +54,28 @@ sealed interface CompressionRequest {
             if (!editStatePresent) {
                 return Invalid("editState is missing")
             }
-            if (targetSizeMb <= 0f || !targetSizeMb.isFinite()) {
-                return Invalid("targetSizeMb must be > 0")
+
+            // ── Auto-adjust instead of rejecting (was: Invalid) ──────────
+            var safeTarget = targetSizeMb
+            if (!safeTarget.isFinite() || safeTarget <= 0f) {
+                safeTarget = ABSOLUTE_MIN_MB
             }
-            if (beforeSize < 0L) {
-                return Invalid("beforeSize must be >= 0")
-            }
-            if (beforeSize > 0L) {
-                val targetBytes = (targetSizeMb * 1_048_576f).toLong()
-                if (targetBytes > beforeSize) {
-                    return Invalid("Target size is larger than the source file")
+            val safeBeforeSize = beforeSize.coerceAtLeast(0L)
+            if (safeBeforeSize > 0L) {
+                val targetBytes = (safeTarget * BYTES_PER_MB).toLong()
+                if (targetBytes > safeBeforeSize) {
+                    safeTarget = safeBeforeSize / BYTES_PER_MB.toFloat()
+                    safeTarget = safeTarget.coerceAtLeast(ABSOLUTE_MIN_MB)
                 }
             }
+            // ─────────────────────────────────────────────────────────────
+
             return Valid(
                 inputUri = inputUri,
                 outputPath = outputPath,
                 codec = codec,
-                targetSizeMb = targetSizeMb,
-                beforeSize = beforeSize,
+                targetSizeMb = safeTarget,
+                beforeSize = safeBeforeSize,
             )
         }
     }

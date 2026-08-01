@@ -269,7 +269,7 @@ fun SettingsScreen(
                 // ── About ─────────────────────────────────────────────────────
                 SettingsSection(title = "About") {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        InfoRow("App version",      "Minify V7-Experimental")
+                        InfoRow("App version",      "Minify V7")
                         InfoRow("Developer",   "Riyan Bharadwaj")
                         InfoRow("Official page", "github.com/riyanbharadwaj/minify")
                     }

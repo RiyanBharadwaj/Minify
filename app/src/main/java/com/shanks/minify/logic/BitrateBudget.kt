@@ -50,21 +50,9 @@ object BitrateBudget {
     private const val MIN_HIGH_FPS_TARGET_BPS = 2_500_000
     private const val REDUCED_FPS = 30f
 
-    /**
-     * Computes the output budget for [targetSizeMb], mirroring the argument shape of the
-     * old `computeParams`. Returns [BudgetResult.Invalid] instead of throwing when the
-     * source parameters or computed dimensions cannot yield a valid output.
-     *
-     * @param targetSizeMb requested maximum output size in MB (1 MB = 1,048,576 bytes).
-     * @param durationSecs effective output duration in seconds (post-trim); may be <= 0
-     *   when metadata is unavailable, in which case a source-bitrate-derived fallback is used.
-     * @param srcBitrateKbps source video bitrate in kbps, used only for the no-duration fallback.
-     * @param srcWidth source (or cropped) width in pixels.
-     * @param srcHeight source (or cropped) height in pixels.
-     * @param frameRate source frame rate.
-     * @param codecChoice selected output codec (drives the bits-per-pixel target).
-     * @param headroom fraction of the target to actually budget for (defaults to [HEADROOM]).
-     */
+    /** Smallest encoder-valid dimension (one macroblock). */
+    private const val MIN_DIMENSION = 16
+
     fun compute(
         targetSizeMb: Float,
         durationSecs: Long,
@@ -76,24 +64,26 @@ object BitrateBudget {
         headroom: Float = HEADROOM,
         removeAudio: Boolean = false,
     ): BudgetResult {
-        if (targetSizeMb <= 0f) {
-            return BudgetResult.Invalid("Target size must be positive, got $targetSizeMb MB")
-        }
+        // ── Only truly impossible inputs are rejected ────────────────────
         if (srcWidth <= 0 || srcHeight <= 0) {
-            return BudgetResult.Invalid("Source dimensions must be positive, got ${srcWidth}x$srcHeight")
+            return BudgetResult.Invalid(
+                "Source dimensions must be positive, got ${srcWidth}x$srcHeight"
+            )
         }
+        // Non-positive / non-finite target is clamped to the absolute floor
+        // instead of returning Invalid (auto-adjust, don't crash).
+        val safeTargetMb = if (!targetSizeMb.isFinite() || targetSizeMb <= 0f) 0.1f else targetSizeMb
+        // ─────────────────────────────────────────────────────────────────
 
         val safeHeadroom = headroom.coerceIn(0f, 1f)
-        // Bits available after reserving muxing headroom (Req 7.7).
-        val targetBits = (targetSizeMb * BITS_PER_MB * safeHeadroom).toLong().coerceAtLeast(1L)
+        val targetBits = (safeTargetMb * BITS_PER_MB * safeHeadroom).toLong().coerceAtLeast(1L)
 
-        // --- Audio reservation (Req 7.2): fixed nominal bitrate, capped at 40% of budget. ---
         val nominalAudioBudget =
             if (durationSecs > 0 && !removeAudio) AUDIO_NOMINAL_KBPS * 1000L * durationSecs else 0L
         val maxAudioBudget = (targetBits * MAX_AUDIO_SHARE).toLong().coerceAtLeast(0L)
         val effectiveAudioBudget = nominalAudioBudget.coerceAtMost(maxAudioBudget)
+
         val audioBitrateBps = if (durationSecs > 0 && !removeAudio) {
-            // May fall below AUDIO_MIN_KBPS when the 40% cap binds — allowed by Req 7.2.
             (effectiveAudioBudget / durationSecs).toInt().coerceAtMost(AUDIO_MAX_KBPS * 1000)
         } else if (removeAudio) {
             0
@@ -101,43 +91,46 @@ object BitrateBudget {
             (AUDIO_NOMINAL_KBPS * 1000).coerceIn(AUDIO_MIN_KBPS * 1000, AUDIO_MAX_KBPS * 1000)
         }
 
-        // --- Video budget: everything the audio didn't take. Non-decreasing in target. ---
         val videoBudgetBits = (targetBits - effectiveAudioBudget).coerceAtLeast(0L)
         val videoBitrateRaw = if (durationSecs > 0) {
             (videoBudgetBits / durationSecs).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         } else {
-            // No duration: scale off the source bitrate so the result at least tracks the
-            // source's own demand. Independent of target size, hence trivially monotone.
             (srcBitrateKbps.toLong() * 1000L).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
         }
-        // Highest bitrate that fits the budget, clamped to the supported band (Req 7.3).
         val videoBitrateBps = videoBitrateRaw.coerceIn(MIN_VIDEO_BPS, MAX_VIDEO_BPS)
 
         val outFps = pickOutputFrameRate(frameRate, videoBitrateBps)
 
-        // --- Output dimensions: positive even multiples of 16, no larger than source (Req 7.8). ---
         val targetBpp = when (codecChoice) {
-            CodecChoice.AV1 -> 0.08f
+            CodecChoice.AV1  -> 0.08f
             CodecChoice.H265 -> 0.12f
             CodecChoice.H264 -> 0.18f
         }
         val aspect = srcWidth.toFloat() / srcHeight.toFloat()
         val rawHeight = sqrt(videoBitrateBps.toFloat() / (targetBpp * outFps) / aspect)
-        if (!rawHeight.isFinite() || rawHeight <= 0f) {
-            return BudgetResult.Invalid("Computed a non-finite output height from the budget")
+
+        // ── Clamp dimensions instead of returning Invalid ────────────────
+        val clampedRawHeight = if (!rawHeight.isFinite() || rawHeight <= 0f) {
+            MIN_DIMENSION.toFloat()
+        } else {
+            rawHeight
         }
 
-        // Floor to a multiple of 16 (never rounding up past the source) so the result is
-        // guaranteed <= source and a valid encoder dimension.
-        val outHeight = alignDown16(rawHeight.roundToInt().coerceAtMost(srcHeight))
-        val scaledWidth = (outHeight * aspect).roundToInt().coerceAtMost(srcWidth)
-        val outWidth = alignDown16(scaledWidth)
+        var outHeight = alignDown16(clampedRawHeight.roundToInt().coerceAtMost(srcHeight))
+        var scaledWidth = (outHeight * aspect).roundToInt().coerceAtMost(srcWidth)
+        var outWidth = alignDown16(scaledWidth)
 
-        if (!isValidDimension(outWidth, srcWidth) || !isValidDimension(outHeight, srcHeight)) {
-            return BudgetResult.Invalid(
-                "Output dimensions ${outWidth}x$outHeight are not positive multiples of 16 within source ${srcWidth}x$srcHeight"
-            )
-        }
+        // If alignDown16 produced 0 (source < 16 px on an axis), fall back to
+        // the smallest valid encoder dimension that still fits the source.
+        if (outHeight < MIN_DIMENSION) outHeight = MIN_DIMENSION.coerceAtMost(srcHeight)
+        if (outWidth  < MIN_DIMENSION) outWidth  = MIN_DIMENSION.coerceAtMost(srcWidth)
+
+        // Last-resort: if even MIN_DIMENSION exceeds the source (e.g. 10×10),
+        // use the source dimension rounded down to the nearest even number.
+        // Media3 can handle non-multiple-of-16 via Presentation scaling.
+        if (outHeight <= 0) outHeight = srcHeight.coerceAtLeast(2)
+        if (outWidth  <= 0) outWidth  = srcWidth.coerceAtLeast(2)
+        // ─────────────────────────────────────────────────────────────────
 
         return BudgetResult.Valid(
             VideoBudget(
@@ -155,10 +148,5 @@ object BitrateBudget {
         return if (fps > REDUCED_FPS && videoTargetBps < MIN_HIGH_FPS_TARGET_BPS) REDUCED_FPS else fps
     }
 
-    /** Largest multiple of 16 that is <= [v]. Returns 0 for non-positive input. */
     private fun alignDown16(v: Int): Int = if (v <= 0) 0 else (v / 16) * 16
-
-    /** A valid output dimension is a positive multiple of 16 no larger than [source]. */
-    private fun isValidDimension(value: Int, source: Int): Boolean =
-        value > 0 && value % 16 == 0 && value <= source
 }
