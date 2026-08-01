@@ -44,7 +44,7 @@ Minify is a high-performance Android media compression and editing app. It deliv
 
 ## 📥 Getting Started
 
-1. Download the latest APK from the [Releases](https://github.com/shanks-minify/minify/releases) section.
+1. Download the latest APK from the [Releases](https://github.com/RiyanBharadwaj/Minify/releases) section.
 2. Grant the necessary media permissions.
 3. Select a video or photo, set your target size, and hit Compress!
 
