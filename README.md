@@ -66,7 +66,7 @@ Contributions are welcome! Whether it's reporting a bug, suggesting a feature, o
 
 ## 📄 License
 
-This project is licensed under the **MIT License**.
+This project is licensed under the **GNU General Public License v3.0**.
 
 ---
 
